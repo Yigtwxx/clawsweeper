@@ -1,13 +1,28 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { useFakeScanner } from "./agent-input-scan-helpers.ts";
 
 import { reviewNetworkCapability, runAgentProcess } from "../dist/agent-runner.js";
 import { parseOpenclawJsonEnvelope, runOpenclawProcess } from "../dist/openclaw-process.js";
 import { codexProcessErrorCode } from "../dist/codex-process.js";
+
+const OPENCLAW_PROCESS_WORKER_PATH = fileURLToPath(
+  new URL("../dist/openclaw-process-worker.js", import.meta.url),
+);
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
 
 function fakeOpenclaw(root: string): string {
   const binary = join(root, "fake-openclaw");
@@ -655,3 +670,87 @@ test("OpenClaw zai models get built-in Coding Plan endpoint defaults", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test(
+  "OpenClaw worker kills a child that ignores SIGTERM when the worker itself is terminated",
+  { skip: process.platform === "win32" ? "uses POSIX signals" : false },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "clawsweeper-openclaw-test-"));
+    const pidPath = join(root, "openclaw.pid");
+    const binary = join(root, "hanging-openclaw");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
+process.on("SIGTERM", () => {});
+fs.writeFileSync(
+  process.env.OPENCLAW_TEST_PID_PATH,
+  JSON.stringify({ child: process.pid, grandchild: grandchild.pid }),
+);
+setInterval(() => {}, 1000);
+`,
+    );
+    chmodSync(binary, 0o755);
+    const optionsPath = join(root, "worker-options.json");
+    const resultPath = join(root, "result.json");
+    writeFileSync(
+      optionsPath,
+      JSON.stringify({
+        args: [],
+        command: binary,
+        timeoutMs: 60_000,
+        resultPath,
+        stdoutPath: join(root, "stdout.log"),
+        stderrPath: join(root, "stderr.log"),
+        tailBytes: 4096,
+        maxOutputFileBytes: 65_536,
+      }),
+    );
+    const worker = spawn(process.execPath, [OPENCLAW_PROCESS_WORKER_PATH, optionsPath], {
+      cwd: root,
+      env: { ...process.env, OPENCLAW_TEST_PID_PATH: pidPath },
+      stdio: "ignore",
+    });
+    const workerExit = new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve) => worker.once("exit", (code, signal) => resolve({ code, signal })));
+    let pids: { child: number; grandchild: number } | undefined;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(pidPath)) {
+        if (Date.now() > deadline) throw new Error("hanging OpenClaw child never started");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      pids = JSON.parse(readFileSync(pidPath, "utf8")) as {
+        child: number;
+        grandchild: number;
+      };
+      worker.kill("SIGTERM");
+      const exit = await workerExit;
+      const reapDeadline = Date.now() + 3_000;
+      while (Date.now() < reapDeadline && [pids.child, pids.grandchild].some(processAlive)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      for (const pid of [pids.child, pids.grandchild]) {
+        assert.equal(processAlive(pid), false, `pid ${pid} survived worker termination`);
+      }
+      assert.equal(exit.code, 0, JSON.stringify(exit));
+      const result = JSON.parse(readFileSync(resultPath, "utf8")) as { signal: string | null };
+      assert.equal(result.signal, "SIGKILL");
+    } finally {
+      for (const pid of [pids?.child, pids?.grandchild]) {
+        if (pid) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
