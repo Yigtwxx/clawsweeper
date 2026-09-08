@@ -467,6 +467,11 @@ therefore carry a compact ledger of earlier cycles inside a collapsed
 <!-- clawsweeper-review-history v=1 total=<completed-earlier-cycle-count> -->
 ```
 
+The visible freshness line adds `(Revision N)` from the second completed PR
+review onward, using this lifetime count plus the current review. A first review
+and issue comments have no revision suffix; re-syncing the same review keeps
+the same revision number.
+
 Each ledger line records one completed earlier cycle: reviewed-at timestamp,
 reviewed head sha, verdict, and finding titles. The marker's `total` attribute
 keeps the lifetime count when the visible ledger is capped. When the apply lane
