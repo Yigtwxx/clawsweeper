@@ -140,6 +140,7 @@ test("queue completion tolerates only terminal-reason deploy skew", async (t) =>
         const child = spawn("bash", ["-c", producers[0].run], {
           env: {
             ...process.env,
+            SOURCE_CHECKOUT_OUTCOME: "success",
             QUEUE_URL: `http://127.0.0.1:${address.port}`,
             QUEUE_LEASE_ID: "synthetic-lease",
             PROTOCOL_VERSION: "2",
@@ -1563,7 +1564,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     /direct-exact-review-publication\.outputs\.accepted != 'true' \|\| steps\.finalize-direct-exact-review-lifecycle\.outcome != 'success'/,
   );
   assert.equal(upload.with?.["retention-days"], 90);
-  assert.match(queuePublication.run ?? "", /for attempt in 1 2 3/);
+  assert.match(queuePublication.run ?? "", /control_plane_curl/);
   assert.match(queuePublication.run ?? "", /\.queued == true or \.deduped == true/);
   assert.equal(queuePublication.env?.CLAIM_DECISION, "${{ steps.live-item.outputs.decision }}");
   assert.equal(
@@ -1806,7 +1807,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     "${{ steps.publication-context.outputs.item_number }}",
   );
   const publisherCheckout = publisher.steps.find(
-    (candidate) => candidate.uses === "actions/checkout@v7",
+    (candidate) => candidate.uses === "actions/checkout@v7" && candidate.if,
   );
   assert.ok(publisherCheckout);
   assert.equal(publisherCheckout.with?.ref, "main");
@@ -2306,8 +2307,8 @@ test("exact event publication derives lifecycle receipt and final command acknow
   assert.doesNotMatch(complete.run ?? "", /outcome !== "success"\s*\?\s*"failure"/);
   assert.match(complete.run ?? "", /completionKind === "permanent_failure"\s*\? "failure"/);
   const finalizer = workflow.jobs["event-review-terminal-finalization"]!;
-  const finalizationCheckout = finalizer.steps.find((candidate) =>
-    candidate.uses?.startsWith("actions/checkout@"),
+  const finalizationCheckout = finalizer.steps.find(
+    (candidate) => candidate.uses?.startsWith("actions/checkout@") && candidate.if,
   );
   assert.equal(finalizationCheckout?.with?.filter, undefined);
   assert.equal(finalizationCheckout?.with?.["fetch-depth"], 1);
@@ -2562,7 +2563,7 @@ test("exact-review lease competition skips only known conflicts and gates both o
     ["event-review-apply", "claim-exact-review-queue"],
     ["event-review-publish", "publication-context"],
   ]) {
-    const steps = workflow.jobs[jobName]!.steps;
+    const steps = workflow.jobs[jobName]!.steps.slice(1);
     const claim = steps[0]!;
     const claimRun = claim.run ?? "";
     const gate = `steps.${claimId}.outputs.claimed == 'true'`;
@@ -6407,7 +6408,7 @@ test("failed review recovery waits for durable exact-review queue acknowledgemen
   assert.match(recoveryBlock, /Recovery shed by exact-review queue backpressure/);
   assert.doesNotMatch(recoveryBlock, /workflow run sweep\.yml/);
   assert.doesNotMatch(recoveryBlock, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
-  assert.match(recoveryBlock, /for attempt in 1 2 3/);
+  assert.match(recoveryBlock, /control_plane_curl/);
 });
 
 test("target sweep dispatches preserve disabled ClawHub guard", () => {
@@ -7476,4 +7477,105 @@ test("apply job requeues drift-blocked close reviews only for default cursor run
   assert.match(step, /event_type: "clawsweeper_item"/);
   assert.match(step, /source_action: "source_drift_requeue"/);
   assert.match(step, /supersedes_in_progress: false/);
+});
+
+test("all workflow control-plane curls use the shared helper after download or full checkout", () => {
+  for (const file of [
+    "sweep.yml",
+    "exact-review-reconcile-run.yml",
+    "exact-review-dead-letter-reconcile.yml",
+  ]) {
+    const workflow = YAML.parse(readText(`.github/workflows/${file}`));
+    for (const [jobName, job] of Object.entries(workflow.jobs) as [string, any][]) {
+      let checkedOut = false;
+      let downloaded = false;
+      for (const step of job.steps ?? []) {
+        if (step.uses?.startsWith("actions/checkout@")) checkedOut = true;
+        const run = step.run ?? "";
+        assert.doesNotMatch(run, /\bcurl --/, `${file}: ${step.name}`);
+        if (step.name === "Fetch control-plane retry helper") {
+          assert.match(
+            run,
+            /curl -fsSL --retry 3 "https:\/\/raw\.githubusercontent\.com\/\$\{GITHUB_REPOSITORY\}\/\$\{GITHUB_SHA\}\/scripts\/control-plane-curl\.sh"/,
+          );
+          assert.match(run, /test -s "\$RUNNER_TEMP\/control-plane-curl\.sh"/);
+          assert.match(run, /declare -F control_plane_curl/);
+          downloaded = true;
+          continue;
+        }
+        if (!run.includes("control_plane_curl")) continue;
+        assert.ok(
+          checkedOut || downloaded,
+          `${file}: ${jobName} has the helper before its first call`,
+        );
+        assert.match(
+          run,
+          checkedOut
+            ? /source scripts\/control-plane-curl.sh/
+            : /source "\$RUNNER_TEMP\/control-plane-curl.sh"/,
+        );
+        assert.doesNotMatch(run, /for attempt in 1 2 3; do/);
+        const syntax = spawnSync("bash", ["-n"], { input: run, encoding: "utf8" });
+        assert.equal(syntax.status, 0, `${step.name}: ${syntax.stderr}`);
+      }
+    }
+  }
+});
+
+test("pre-checkout helper bootstrap fails on download errors, empty files, and missing functions", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  const bootstrap = workflow.jobs["event-review-apply"].steps.find(
+    (step: any) => step.name === "Fetch control-plane retry helper",
+  ).run;
+  const root = mkdtempSync(`${tmpPrefix}helper-bootstrap-`);
+  try {
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    for (const [fixture, expected] of [
+      ["exit 22", 22],
+      ['while [ "$1" != "-o" ]; do shift; done; : > "$2"', 1],
+      ['while [ "$1" != "-o" ]; do shift; done; echo ":" > "$2"', 1],
+      ['while [ "$1" != "-o" ]; do shift; done; echo "control_plane_curl() { :; }" > "$2"', 0],
+    ] as const) {
+      writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\n${fixture}\n`, { mode: 0o755 });
+      const result = spawnSync("bash", ["-c", bootstrap], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${bin}${delimiter}${process.env.PATH}`,
+          RUNNER_TEMP: root,
+          GITHUB_REPOSITORY: "openclaw/clawsweeper",
+          GITHUB_SHA: "synthetic-commit",
+        },
+      });
+      assert.equal(result.status, expected, `${fixture}: ${result.stderr}`);
+      assert.equal(existsSync(join(root, ".git")), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("claimed-lease cleanup survives skipped and failed checkouts and uses source after success", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  for (const [jobName, stepName] of [
+    ["event-review-apply", "Complete exact-review queue lease"],
+    ["event-review-publish", "Complete durable exact review publication"],
+    ["event-review-terminal-finalization", "Requeue unobserved terminal acknowledgement"],
+  ]) {
+    const steps = workflow.jobs[jobName].steps;
+    const checkout = steps.find((step: any) => step.id === "source-checkout");
+    assert.ok(checkout.uses.startsWith("actions/checkout@"));
+    const cleanup = steps.find((step: any) => step.name === stepName);
+    assert.equal(cleanup.env.SOURCE_CHECKOUT_OUTCOME, "${{ steps.source-checkout.outcome }}");
+    assert.match(cleanup.if, /always\(\)/);
+  }
+  const proof = JSON.parse(
+    execFileSync(process.execPath, ["scripts/e2e/control-plane-checkout-cleanup.mjs"], {
+      encoding: "utf8",
+    }),
+  );
+  assert.equal(proof.ok, true);
+  assert.equal(proof.cases.length, 9);
 });
