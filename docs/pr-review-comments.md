@@ -376,6 +376,10 @@ Full review comments, source links, owner routing, acceptance criteria, and
 evidence stay under the collapsed `Agent review details` block so the top-level
 PR comment reads like a concise review.
 
+Finding-shaped headings and `body`, `late`, or `confidence` list fields quoted
+inside model prose are escaped before storage. They remain quoted text when
+the durable report is parsed again and cannot add findings or replace scores.
+
 Automerge and autofix state belongs in the command/status comment and hidden
 markers, not in the public review section headings. A clean opted-in PR should
 still read as `Codex review: passed.` in the durable review comment.
