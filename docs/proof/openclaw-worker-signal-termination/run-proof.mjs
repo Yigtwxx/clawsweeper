@@ -23,6 +23,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,16 +38,6 @@ if (process.platform === "win32") {
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..", "..");
 const WORKER = "src/openclaw-process-worker.ts";
-
-const args = process.argv.slice(2);
-const option = (name, fallback) => {
-  const index = args.indexOf(name);
-  return index === -1 ? fallback : args[index + 1];
-};
-const baseRev = option("--base", defaultBaseRev());
-const outDir = resolve(repoRoot, option("--out", ".artifacts/openclaw-worker-signal-termination"));
-const providedBaselineDist = option("--baseline-dist", "");
-mkdirSync(outDir, { recursive: true });
 
 const git = (...gitArgs) =>
   execFileSync("git", gitArgs, { cwd: repoRoot, encoding: "utf8" }).trim();
@@ -63,11 +54,24 @@ function defaultBaseRev() {
   } catch {
     try {
       return git("merge-base", "HEAD", "origin/main");
-    } catch {
+    } catch (error) {
+      console.warn(
+        `origin/main is unavailable (${error.message.trim()}); using HEAD~1 as the baseline`,
+      );
       return "HEAD~1";
     }
   }
 }
+
+const args = process.argv.slice(2);
+const option = (name, fallback) => {
+  const index = args.indexOf(name);
+  return index === -1 ? fallback : args[index + 1];
+};
+const baseRev = option("--base", defaultBaseRev());
+const outDir = resolve(repoRoot, option("--out", ".artifacts/openclaw-worker-signal-termination"));
+const providedBaselineDist = option("--baseline-dist", "");
+mkdirSync(outDir, { recursive: true });
 
 function compileBaselineDist() {
   const baseSha = git("rev-parse", baseRev);
@@ -80,6 +84,10 @@ function compileBaselineDist() {
   rmSync(baselineRoot, { recursive: true, force: true });
   cpSync(join(repoRoot, "src"), baselineSrc, { recursive: true });
   writeFileSync(join(baselineRoot, WORKER), baselineSource);
+  // The copy must resolve modules and the ESM package type the way the checkout does,
+  // even when the output directory lives outside the repository.
+  writeFileSync(join(baselineRoot, "package.json"), `${JSON.stringify({ type: "module" })}\n`);
+  symlinkSync(join(repoRoot, "node_modules"), join(baselineRoot, "node_modules"), "junction");
   const baselineDist = join(baselineRoot, "dist");
   const posix = (value) => value.replace(/\\/g, "/");
   writeFileSync(

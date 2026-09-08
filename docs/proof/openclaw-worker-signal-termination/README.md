@@ -16,7 +16,8 @@ grandchild are still alive three seconds later. Two scenarios run per arm: the
 direct child ignores `SIGTERM`, and the direct child exits on `SIGTERM` while
 its grandchild ignores it. The baseline arm compiles
 `src/openclaw-process-worker.ts` from the base commit inside an isolated copy of
-`src/` under the output directory, so the tracked checkout is never modified;
+`src/` under the output directory (with its own `package.json` and a link to the
+repository's `node_modules`), so the tracked checkout is never modified;
 the candidate arm uses the current build. No model inference, network access,
 or credential is involved. The driver is POSIX only.
 
