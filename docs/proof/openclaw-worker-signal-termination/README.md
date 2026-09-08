@@ -6,13 +6,17 @@ worker itself, which is what a job cancellation, a runner shutdown, or the outer
 `spawnSync` deadline sends, never reached that group: the worker exited and
 the CLI and its descendants kept running. The Codex process worker already
 forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to its process tree; this proof
-shows the OpenClaw worker now does the same.
+shows the OpenClaw worker now does the same, and that descendants are still
+stopped when the direct child exits before the `SIGKILL` escalation fires.
 
 [`run-proof.mjs`](run-proof.mjs) starts the compiled worker with a fake
-`openclaw` binary that spawns a grandchild, ignores `SIGTERM`, and never exits,
-then sends `SIGTERM` to the worker and records whether the child and grandchild
-are still alive three seconds later. The baseline arm compiles
-`src/openclaw-process-worker.ts` from the base commit into a separate `dist`;
+`openclaw` binary that spawns a signal-ignoring grandchild and never exits on
+its own, then sends `SIGTERM` to the worker and records whether the child and
+grandchild are still alive three seconds later. Two scenarios run per arm: the
+direct child ignores `SIGTERM`, and the direct child exits on `SIGTERM` while
+its grandchild ignores it. The baseline arm compiles
+`src/openclaw-process-worker.ts` from the base commit inside an isolated copy of
+`src/` under the output directory, so the tracked checkout is never modified;
 the candidate arm uses the current build. No model inference, network access,
 or credential is involved. The driver is POSIX only.
 
@@ -21,18 +25,22 @@ pnpm run build
 node docs/proof/openclaw-worker-signal-termination/run-proof.mjs --out .artifacts/openclaw-worker-signal-termination
 ```
 
-`--base <rev>` selects the baseline commit (default `HEAD~1`); `--baseline-dist`
+`--base <rev>` selects the baseline commit (default: the merge base with
+`origin/main`, or `HEAD~1` once the change is on `main`); `--baseline-dist`
 reuses a previously compiled baseline. The driver writes `summary.json` with
 the worker exit status, the elapsed time until the worker exited, the elapsed
-time until the tree was gone, and the recorded result signal for each arm, and
-exits non-zero unless the baseline leaves both processes alive and the
-candidate stops both.
+time until the tree was gone, and the recorded result signal for each arm and
+scenario, and exits non-zero unless the baseline leaves both processes alive
+in both scenarios and the candidate stops both in both scenarios.
 
-Expected result: the baseline worker dies from `SIGTERM` without writing a
-result, and both the child and the grandchild survive the three-second wait;
-the candidate worker forwards the signal, escalates to `SIGKILL` after one
-second because the child ignores `SIGTERM`, records `signal: "SIGKILL"` in its
-result file, exits with code 0, and leaves no surviving process.
+Expected result: in both scenarios the baseline worker dies from `SIGTERM`
+without writing a result, and both the child and the grandchild survive the
+three-second wait. The candidate worker forwards the signal; with a
+`SIGTERM`-ignoring child it escalates to `SIGKILL` after one second and records
+`signal: "SIGKILL"`, and with a child that exits on `SIGTERM` it sends `SIGKILL`
+to the remaining process group when the child closes and records
+`signal: "SIGTERM"`. In both cases it exits with code 0 and leaves no surviving
+process.
 
 Limits: controlled compiled run with a fake CLI; it does not claim a specific
 production cancellation left an orphaned `openclaw` process. Windows keeps the

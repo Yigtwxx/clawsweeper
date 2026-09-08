@@ -57,7 +57,12 @@ child.once("error", (error) => {
   spawnError = error;
 });
 child.once("close", (status, signal) => {
-  if (forceKillTimer) clearTimeout(forceKillTimer);
+  if (forceKillTimer) {
+    clearTimeout(forceKillTimer);
+    // The direct child is gone, but detached descendants in its process group may
+    // still be running; finish the escalation before this worker exits.
+    signalProcessGroup(child, "SIGKILL");
+  }
   clearTimeout(timeout);
   closeCodexOutputCapture(stdout);
   closeCodexOutputCapture(stderr);
