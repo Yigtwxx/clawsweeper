@@ -427,6 +427,10 @@ The workflow needs:
   environment for these settings, default to two minutes, and enforce a
   30-second minimum for environment-configured budgets. An explicit `timeoutMs`
   call option takes precedence and may select a shorter positive deadline.
+  Cluster dispatch uses the same two-minute default; automatic worker target
+  clones default to three minutes. Both honor the same environment overrides
+  and report child-process timeout failures. A timed-out dispatch keeps its
+  durable claim for observation/recovery rather than immediately dispatching again.
 - optional `CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS` and `CLAWSWEEPER_RESOLVE_REVIEW_THREADS` variables for agentic merge-prep review loops; the review attempt default is `4`, with the last failed internal review converted into one final Codex review-fix pass when changed-surface validation can still prove the branch safe to push for exact-head review
 - optional `CLAWSWEEPER_MAX_REPAIRS_PER_PR` and
   `CLAWSWEEPER_MAX_REPAIRS_PER_HEAD` variables for trusted
