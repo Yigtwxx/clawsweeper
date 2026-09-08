@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -11,9 +11,11 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import YAML from "yaml";
+import { AGENT_INPUT_SCAN_FAILURE_REASONS } from "../dist/exact-review-failure-reason.js";
 
 import { makeTreeReadOnlyForTest, restoreTreeModesForTest } from "../dist/clawsweeper.js";
 import {
@@ -25,6 +27,187 @@ import {
   workPlanCandidateReport,
 } from "./helpers.ts";
 import { scheduledReviewSemanticSourceRevision } from "../scripts/classify-scheduled-review-noop.ts";
+
+test("review workflow emits terminal reasons for non-retryable scanner manifests", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  const producers = Object.values(workflow.jobs).flatMap((job: any) =>
+    (job.steps ?? []).filter((step: any) => /echo "failure_reason=/.test(step.run ?? "")),
+  );
+  assert.equal(producers.length, 1, "audit every terminal-reason producer when lanes change");
+  const root = mkdtempSync(`${tmpPrefix}terminal-scan-workflow-`);
+  try {
+    const manifestDir = join(root, "artifacts/event/failure-diagnostics");
+    mkdirSync(manifestDir, { recursive: true });
+    const output = join(root, "outputs");
+    for (const producer of producers) {
+      const body = producer.run as string;
+      const shell = body.slice(
+        body.indexOf('echo "exit_code=$review_exit_code"'),
+        body.indexOf('coordination_held_path="artifacts/event/coordination-held.json"'),
+      );
+      assert.ok(shell.includes('exit "$review_exit_code"'));
+      for (const reason of AGENT_INPUT_SCAN_FAILURE_REASONS) {
+        for (const retryable of [false, true]) {
+          writeFileSync(output, "");
+          writeFileSync(
+            join(manifestDir, "manifest.json"),
+            JSON.stringify({
+              classification: "codex_or_content_failure",
+              retryable,
+              failure: { stage: "agent_input_scan", reason_code: reason },
+            }),
+          );
+          const result = spawnSync("bash", ["-c", `set -euo pipefail\n${shell}`], {
+            cwd: root,
+            encoding: "utf8",
+            env: { ...process.env, review_exit_code: "1", GITHUB_OUTPUT: output },
+          });
+          assert.equal(result.status, 1, result.stderr);
+          const outputs = readFileSync(output, "utf8").split("\n");
+          assert.equal(outputs.includes(`failure_reason=${reason}`), !retryable, reason);
+        }
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("queue completion tolerates only terminal-reason deploy skew", async (t) => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  const producers = Object.values(workflow.jobs).flatMap((job: any) =>
+    (job.steps ?? []).filter((step: any) => /review_failure_reason:/.test(step.run ?? "")),
+  );
+  assert.equal(producers.length, 1, "audit every completion reason producer when lanes change");
+  const detail = { stage: "agent_input_scan", reason_code: "deadline", retryable: false };
+  const cases = [
+    { name: "compatible Worker", replies: [200], exit: 0, fallback: false },
+    { name: "old Worker", replies: [400, 200], exit: 0, fallback: true },
+    {
+      name: "unrelated bad request",
+      replies: [400],
+      error: "invalid_outcome",
+      exit: 1,
+      fallback: false,
+    },
+    { name: "malformed response", replies: [400], raw: "not JSON", exit: 1, fallback: false },
+    { name: "no reason sent", replies: [400], reason: "", exit: 1, fallback: false },
+    { name: "fallback rejected", replies: [400, 400], exit: 1, fallback: true },
+    {
+      name: "fallback superseded",
+      replies: [400, 409],
+      error409: "lease_superseded",
+      exit: 0,
+      fallback: true,
+    },
+    {
+      name: "fallback ownership conflict",
+      replies: [400, 409],
+      error409: "lease_not_active",
+      exit: 1,
+      fallback: true,
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const requests: Record<string, any>[] = [];
+      let completed = false;
+      const server = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        requests.push(JSON.parse(body));
+        const code = scenario.replies[requests.length - 1] ?? 500;
+        completed ||= code === 200;
+        res.writeHead(code, { "content-type": "application/json" });
+        res.end(
+          scenario.raw ??
+            JSON.stringify(
+              code === 200
+                ? { ok: true }
+                : {
+                    error:
+                      code === 409
+                        ? scenario.error409
+                        : (scenario.error ?? "invalid_review_failure_reason"),
+                  },
+            ),
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        assert.ok(address && typeof address !== "string");
+        const child = spawn("bash", ["-c", producers[0].run], {
+          env: {
+            ...process.env,
+            QUEUE_URL: `http://127.0.0.1:${address.port}`,
+            QUEUE_LEASE_ID: "synthetic-lease",
+            PROTOCOL_VERSION: "2",
+            QUEUE_LEASE_REVISION: "1",
+            CLAIM_GENERATION: "1",
+            ITEM_KEY: "openclaw/clawsweeper#1",
+            GITHUB_RUN_ID: "100",
+            RUN_ATTEMPT: "1",
+            PRIMARY_OUTCOME: "failure",
+            REQUEUE_LATEST: "false",
+            RETRY_KIND: "",
+            RETRY_AT: "",
+            DIRECT_PUBLICATION_ACCEPTED: "false",
+            DIRECT_LIFECYCLE_OUTCOME: "",
+            REVIEW_FAILURE_REASON: scenario.reason ?? "deadline",
+            REVIEW_FAILURE_STAGE: detail.stage,
+            REVIEW_FAILURE_REASON_CODE: detail.reason_code,
+            REVIEW_FAILURE_RETRYABLE: "false",
+            HAS_COMMAND_CONTEXT: "false",
+            REVIEW_ITEM_KIND: "pull_request",
+            REVIEW_STATUS_VERIFIED: "false",
+            REVIEW_ACKNOWLEDGEMENT_COMMENT_ID: "123",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let output = "";
+        child.stdout.on("data", (chunk) => {
+          output += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          output += chunk;
+        });
+        const exit = await new Promise<number | null>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", resolve);
+        });
+        assert.equal(exit, scenario.exit, output);
+        assert.equal(completed, scenario.replies.includes(200));
+        assert.equal(requests.length, scenario.replies.length);
+        assert.deepEqual(requests[0].review_failure, detail);
+        assert.equal(
+          requests[0].review_failure_reason,
+          scenario.reason === "" ? undefined : "deadline",
+        );
+        assert.equal(
+          (output.match(/::warning::/g) ?? []).length,
+          scenario.fallback ? 1 : 0,
+          output,
+        );
+        if (scenario.fallback) {
+          assert.match(output, /Worker\/workflow deploy skew/);
+          const { review_failure_reason, review_failure_status, ...expected } = requests[0];
+          assert.equal(review_failure_reason, "deadline");
+          assert.deepEqual(review_failure_status, { outcome: "failed", comment_id: 123 });
+          assert.deepEqual(
+            requests[1],
+            expected,
+            "only reason and its dependent status are removed",
+          );
+        }
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    });
+  }
+});
 
 function runCommentSyncShell(root: string, commands: string[]): string {
   return execFileSync(
