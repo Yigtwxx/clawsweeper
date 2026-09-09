@@ -1,10 +1,10 @@
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { oversizedPrSourceSnapshot } from "./clawsweeper-oversized-pr-freshness.js";
 import {
   oversizedPullRequestAdmission,
   oversizedPullRequestContext,
   oversizedPullRequestDecision,
 } from "./clawsweeper-oversized-pr-policy.js";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   decisionPublicationPolicy,
@@ -26,6 +26,7 @@ import type {
   BulkFilerCountCache,
   BulkFilerRepositoryPermissionCache,
   Decision,
+  FileModeSnapshot,
   Item,
   ItemContext,
   PreparedMediaProof,
@@ -36,7 +37,11 @@ import { UserFacingCommandError } from "./command.js";
 import { LOCAL_REVIEW_WEB_SEARCH_CONFIG } from "./commit-sweeper.js";
 import { isReviewedPrActivityCursor } from "./review-activity-cursor.js";
 import { previousClawSweeperReviewDigest } from "./clawsweeper-review-comments.js";
-import { writeExactReviewFailureDiagnostics } from "./clawsweeper-review-failure-diagnostics.js";
+import {
+  EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES,
+  EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES,
+  writeExactReviewFailureDiagnostics,
+} from "./clawsweeper-review-failure-diagnostics.js";
 import {
   reviewStructuralCacheDecision,
   reviewStructuralCacheProbeDecision,
@@ -54,6 +59,20 @@ import { parsePrHydrationSnapshot } from "./pr-hydration-snapshot.js";
 import { ReviewSourcePreparationError } from "./review-source-preparation.js";
 import { commandProofBinding, assertCommandProofSubject } from "./command-proof-assessment.js";
 import { COMMAND_PROOF_SOURCE_ACTION } from "./command-proof-contract.js";
+import {
+  assertActiveReviewOutputBudget,
+  assertReviewOutputFilePeak,
+  assertReviewReportsBudget,
+  assertTransientReviewOutputBudget,
+  configureReviewOutputItems,
+  emitReviewOutput,
+  finalizeSummaryReviewOutput,
+  pruneReviewOutputItem,
+  produceReviewOutput,
+  reviewOutputMediaLimits,
+  writeReviewOutput,
+  type ReviewOutputResult,
+} from "./review-output-policy.js";
 
 /** Bind verified evidence to its candidate before an ordinary full review. */
 export function reviewCommandProofBinding(sourceAction: unknown, additionalPrompt: string) {
@@ -82,6 +101,13 @@ function reviewStartLeaseCommentUpdatedAt(
     if (typeof value === "string" && value.trim()) return value;
   }
   return undefined;
+}
+
+export function localReviewOutputHasPayload(
+  status: "completed" | "failed",
+  resultCount: number,
+): boolean {
+  return status === "completed" || resultCount > 0;
 }
 
 export function withRunnerPreflightProvenance(
@@ -226,6 +252,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
       humanLocalReview,
       openclawDir,
       artifactDir,
+      reviewWorkspaceDir,
       itemsDir,
       batchSize,
       maxPages,
@@ -251,10 +278,50 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
       explicitDispatch,
       maintainerRequest,
       additionalPrompt,
+      outputSelection,
+      outputBudget,
+      retainedReviewOutput,
+      cleanupReviewOutput,
     } = preparation;
-    const proofBinding = reviewCommandProofBinding(args.review_source_action, additionalPrompt);
+    const localOutputResults: ReviewOutputResult[] = [];
+    let outputEmitted = false;
+    let commandError: unknown;
+    let finalizationError: unknown;
+    let reviewCompleted = false;
+    const writeOutputReport = (item: Item, reportPath: string, markdown: string): void => {
+      const next = [...localOutputResults];
+      if (localOnly) {
+        const result = {
+          itemNumber: item.number,
+          path: outputSelection.retention === "none" ? null : reportPath,
+          markdown,
+        };
+        const prior = next.findIndex((candidate) => candidate.itemNumber === item.number);
+        if (prior >= 0) next[prior] = result;
+        else next.push(result);
+        // None-mode files are pruned, but the stdout collection remains live.
+        // Reject the prospective report before writing it or exposing it in JSON.
+        assertReviewReportsBudget(next, outputSelection.retention);
+      }
+      writeReviewOutput(outputBudget, reportPath, markdown, "report");
+      if (localOnly) localOutputResults.splice(0, localOutputResults.length, ...next);
+    };
+    const emitLocalOutput = (status: "completed" | "failed"): void => {
+      if (!localOnly || outputEmitted) return;
+      if (!localReviewOutputHasPayload(status, localOutputResults.length)) return;
+      emitReviewOutput(outputSelection, status, localOutputResults);
+      outputEmitted = true;
+    };
+    const assertCurrentOutputBudget = (): void => {
+      if (outputSelection.retention === "none") {
+        assertTransientReviewOutputBudget(artifactDir);
+      } else if (retainedReviewOutput) {
+        assertActiveReviewOutputBudget(retainedReviewOutput);
+      }
+    };
+    let proofBinding: ReturnType<typeof reviewCommandProofBinding> = null;
     let { git } = preparation;
-    const readonlyModeSnapshots = readonlyOpenclaw ? makeTreeReadOnly(openclawDir) : [];
+    const readonlyModeSnapshots: FileModeSnapshot[] = [];
     const acquiredReviewLeases: Array<{ itemNumber: number; lease: AcquiredReviewStartLease }> = [];
     const releaseOwnedReviewLease = (
       itemNumber: number,
@@ -308,6 +375,10 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
     let completed = 0;
     let cacheHits = 0;
     try {
+      const reviewTreesDir = join(realpathSync(reviewWorkspaceDir), "review-trees");
+      proofBinding = reviewCommandProofBinding(args.review_source_action, additionalPrompt);
+      if (readonlyOpenclaw) makeTreeReadOnly(openclawDir, readonlyModeSnapshots);
+      assertCurrentOutputBudget();
       const selectionOptions: Parameters<typeof selectCandidates>[0] = {
         batchSize,
         maxPages,
@@ -329,6 +400,14 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         : prAdmissionInput
           ? { candidates: [prAdmissionInput.item], scannedPages: 0 }
           : selectCandidates(selectionOptions);
+      const itemOutputBudget = configureReviewOutputItems(
+        outputBudget,
+        Math.max(1, candidates.length),
+      );
+      assertReviewOutputFilePeak(outputSelection.retention, Math.max(1, candidates.length));
+      const writeOutputMetadata = (path: string, content: string): void => {
+        writeReviewOutput(outputBudget, path, content);
+      };
       if (suppliedReviewLease && candidates.length !== 1) {
         throw new UserFacingCommandError(
           "A supplied review lease requires exactly one selected item.",
@@ -350,7 +429,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} selected=${candidates.length} scanned_pages=${scannedPages}`,
         );
       }
-      writeFileSync(
+      writeOutputMetadata(
         join(artifactDir, "selection.json"),
         JSON.stringify({ shardIndex, shardCount, scannedPages, candidates, reviewPolicy }, null, 2),
       );
@@ -378,7 +457,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
       const bulkFilerWindowNow = Date.now();
       const structuralCacheReasons = new Map<string, number>();
       const structuralCacheRevalidationReasons = new Map<string, number>();
-      const codexFailureReports: string[] = [];
+      const codexFailureReports: Array<{ path: string | null; kind: string }> = [];
       const leaseAcquisitionFailureDetails: string[] = [];
       const reviewTreeCleanupFailures: string[] = [];
       // oxfmt-ignore
@@ -389,10 +468,26 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         let pullRequestReviewTreeSha: string | null = null;
         let diagnosticPrompt = "";
         let diagnosticSourceSha = process.env.EXACT_REVIEW_SOURCE_HEAD_SHA;
+        const codexWorkDir = join(artifactDir, "codex");
+        const proofScratchDir = join(codexWorkDir, "proof-scratch", String(item.number));
+        const pruneItemOutput = (reportPath: string): void =>
+          pruneReviewOutputItem({
+            artifactDir,
+            codexWorkDir,
+            proofScratchDir,
+            reportPath,
+            itemNumber: item.number,
+            retention: outputSelection.retention,
+          });
         const recordFailureDiagnostics = (error: unknown, classification = "codex_execution") => {
           if (!process.env.EXACT_REVIEW_ITEM_KEY) return;
           try {
-            writeExactReviewFailureDiagnostics({
+            produceReviewOutput(outputBudget, {
+              paths: [join(artifactDir, "failure-diagnostics")],
+              maxBytes: EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES,
+              maxFiles: EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES,
+              metadata: true,
+            }, () => writeExactReviewFailureDiagnostics({
               artifactDir,
               error,
               prompt: diagnosticPrompt,
@@ -406,7 +501,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 : diagnosticSourceSha,
               retryable: codexReviewFailureRetryable(error),
               workflowExit: agentInputScanFailureExitCode(error) ?? 1,
-            });
+            }));
           } catch {
             console.error("[review] exact-review failure diagnostics could not be written.");
           }
@@ -429,7 +524,6 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               return false;
             }
           }
-          const reviewTreesDir = join(artifactDir, "review-trees");
           ensureDir(reviewTreesDir);
           pullRequestReviewTreeDir = join(reviewTreesDir, String(item.number));
           pullRequestReviewTreeSha = null;
@@ -504,7 +598,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             const runtime = { model: "none", reasoningEffort: "none", contextElapsedMs: 0, codexElapsedMs: 0 };
             const action = reviewActionForDecision({ item, decision, git, runtime });
             const reportPath = join(artifactDir, reportFileName(item.repo, item.number));
-            writeFileSync(reportPath, hostReport(markdownFor({
+            writeOutputReport(item, reportPath, hostReport(markdownFor({
               item, context, decision, git, action, reviewMode: "propose",
               snapshotHash: itemSnapshotHash(item, context), contentDigest: itemContentDigest(item, context),
               reviewPolicy, runtime,
@@ -514,7 +608,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 reviewLeaseOwner: suppliedReviewLease.owner,
                 reviewLeaseCommentId: suppliedReviewLease.commentId,
               } : {}),
-            })), "utf8");
+            })));
             finishReviewActionLedgerItem({ ledger: reviewLedger, item,
               status: ACTION_EVENT_STATUSES.completed, reasonCode: ACTION_EVENT_REASON_CODES.completed,
               retryable: false, cached: false, startedAtMs: reviewLedger.startedAtMs,
@@ -522,6 +616,8 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               completionReason: "oversized_pull_request",
             });
             activeReviewItem = null;
+            assertCurrentOutputBudget();
+            pruneItemOutput(reportPath);
             completed += 1;
             console.error(`[review] oversized_pull_request #${item.number} total=${admission.decision.additions + admission.decision.deletions} hydration=0 scanner=0 codex=0 report=${reportPath}`);
             continue;
@@ -553,8 +649,10 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           );
         }
         const itemLocalReviewHistoryPath = localRangeData
-          ? localReviewHistoryPath
-          : localOnly
+          ? outputSelection.retention === "debug"
+            ? localReviewHistoryPath
+            : null
+          : localOnly && outputSelection.retention === "debug"
             ? localExactReviewHistoryPath(artifactDir, item.repo, item.number)
             : null;
         let previousLocalReviewCommentBody =
@@ -920,7 +1018,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 carried = updateBulkFilerDetectedFrontMatter(carried, bulkFilerDetection);
                 carried = updateReviewStructuralFrontMatter(carried, structuralRecord, true);
                 carried = withRunnerPreflightProvenance(carried, replaceFrontMatterValue);
-                writeFileSync(reportPath, hostReport(carried), "utf8");
+                writeOutputReport(item, reportPath, hostReport(carried));
                 finishReviewActionLedgerItem({
                   ledger: reviewLedger,
                   item,
@@ -950,12 +1048,16 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 if (humanLocalReview) {
                   console.error("");
                   console.error("Structural review cache hit; GitHub context unchanged");
-                  console.error(`  report: ${displayPath(reportPath)}`);
+                  if (outputSelection.retention !== "none") {
+                    console.error(`  report: ${displayPath(reportPath)}`);
+                  }
                 } else {
                   console.error(
                     `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} cache-hit structural-unchanged skip-hydration-model #${item.number} (${completed}/${candidates.length})`,
                   );
                 }
+                assertCurrentOutputBudget();
+                pruneItemOutput(reportPath);
                 continue;
                 }
               }
@@ -1164,6 +1266,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             number: item.number,
             sourceRevision: context.sourceRevision,
             artifactDir,
+            writeOutput: writeOutputMetadata,
           });
         }
         if (skipStartComment) {
@@ -1275,7 +1378,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             ? updateReviewStructuralFrontMatter(carried, structuralRecord, false)
             : replaceFrontMatterValue(carried, "review_structural_cache_hit", "false");
           carried = withRunnerPreflightProvenance(carried, replaceFrontMatterValue);
-          writeFileSync(reportPath, hostReport(carried), "utf8");
+          writeOutputReport(item, reportPath, hostReport(carried));
           finishReviewActionLedgerItem({
             ledger: reviewLedger,
             item,
@@ -1296,26 +1399,34 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           if (humanLocalReview) {
             console.error("");
             console.error("Review cache hit; content unchanged since the last review");
-            console.error(`  report: ${displayPath(reportPath)}`);
+            if (outputSelection.retention !== "none") {
+              console.error(`  report: ${displayPath(reportPath)}`);
+            }
           } else {
             console.error(
               `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} cache-hit content-unchanged skip-model #${item.number} (${completed}/${candidates.length})`,
             );
           }
+          assertCurrentOutputBudget();
+          pruneItemOutput(reportPath);
           continue;
         }
         if (proofBinding) {
           assertCommandProofSubject(proofBinding, pullHeadShaFromContext(context), context.pullRequest ?? context.issue, asRecord(asRecord(context.pullRequest).base).ref, asRecord(asRecord(context.pullRequest).base).sha);
         }
-        const codexWorkDir = join(artifactDir, "codex");
-        const proofScratchDir = join(codexWorkDir, "proof-scratch", String(item.number));
         // --local-range is a pre-PR LOCAL code review — it has no telegram-visible-proof to
         // capture, and prepareMediaProofArtifacts would host-side download media URLs and transcode
         // videos in the synthetic body (commit message / --body-file). Skip it entirely for
         // local-range: no host download or transcode of body-supplied URLs.
         const preparedMediaProof: PreparedMediaProof = localRangeData
           ? { manifestPath: null, summaryPath: null, artifacts: [] }
-          : prepareMediaProofArtifacts(context, proofScratchDir);
+          : prepareMediaProofArtifacts(
+              context,
+              proofScratchDir,
+              undefined,
+              reviewOutputMediaLimits(outputBudget, proofScratchDir),
+              writeOutputMetadata,
+            );
         const reviewEnv = reviewEnvironment(localOnly);
         const prompt = buildReviewPrompt(
           item,
@@ -1343,19 +1454,31 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             console.error("");
             console.error("Running Codex review");
             console.error(`  timeout: ${displayDurationMs(timeoutMs)}`);
-            console.error(
-              `  stdout: ${displayPath(join(codexWorkDir, `${item.number}.1.codex.stdout.log`))}`,
-            );
-            console.error(
-              `  stderr: ${displayPath(join(codexWorkDir, `${item.number}.1.codex.stderr.log`))}`,
-            );
+            if (outputSelection.retention === "none") {
+              console.error("  retained output: none");
+            } else {
+              console.error(
+                `  stdout: ${displayPath(join(codexWorkDir, `${item.number}.1.codex.stdout.log`))}`,
+              );
+              console.error(
+                `  stderr: ${displayPath(join(codexWorkDir, `${item.number}.1.codex.stderr.log`))}`,
+              );
+            }
           }
-          decision = runCodex({
+          decision = produceReviewOutput(outputBudget, {
+            paths: [
+              "prompt.md", "json", "1.codex.stdout.log", "1.codex.stderr.log", "review-thread.json",
+            ].map((suffix) => join(codexWorkDir, `${item.number}.${suffix}`)),
+            maxBytes: itemOutputBudget.promptFileBytes + itemOutputBudget.resultFileBytes +
+              itemOutputBudget.streamFileBytes * 2 + itemOutputBudget.threadStateBytes,
+            maxFiles: 5,
+          }, () => runCodex({
             item,
             context,
             git,
             model,
             openclawDir: reviewOpenclawDir,
+            reviewTreeRoot: reviewTreesDir,
             reasoningEffort,
             sandboxMode,
             serviceTier,
@@ -1367,9 +1490,12 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             proofScratchDir,
             prompt: prompt.text,
             reviewEnv,
+            promptFileBytes: itemOutputBudget.promptFileBytes,
+            resultFileBytes: itemOutputBudget.resultFileBytes,
+            streamFileBytes: itemOutputBudget.streamFileBytes,
             quietLogs: humanLocalReview,
             ...(localRange ? { extraCodexConfig: [LOCAL_REVIEW_WEB_SEARCH_CONFIG] } : {}),
-          });
+          }));
         } catch (error) {
           if (error instanceof AgentInputScanError) throw error;
           codexFailures += 1;
@@ -1386,6 +1512,8 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               {
                 errorCode: error.errorCode,
                 signal: error.signal,
+                diagnostic: error.diagnostic,
+                ...(error.retryHint ? { retryHint: error.retryHint } : {}),
               },
             );
           } else {
@@ -1436,7 +1564,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 }
               : {}),
         }));
-        writeFileSync(reportPath, reportMarkdown, "utf8");
+        writeOutputReport(item, reportPath, reportMarkdown);
         if (codexFailureError) {
           recordFailureDiagnostics(codexFailureError, codexFailureLogKind(reportMarkdown));
         }
@@ -1452,7 +1580,16 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 )
               : previousLocalReviewCommentBody;
           if (nextLocalReviewCommentBody) {
-            writeFileSync(itemLocalReviewHistoryPath, nextLocalReviewCommentBody, "utf8");
+            if (localRangeData) {
+              // Cross-run history belongs to the checkout, not this output run.
+              // Keep that owner/path while bounding the generated replacement.
+              if (Buffer.byteLength(nextLocalReviewCommentBody) > itemOutputBudget.metadataBytes) {
+                throw new UserFacingCommandError("Local review history exceeded its byte limit.");
+              }
+              writeFileSync(itemLocalReviewHistoryPath, nextLocalReviewCommentBody, "utf8");
+            } else {
+              writeOutputMetadata(itemLocalReviewHistoryPath, nextLocalReviewCommentBody);
+            }
           }
         }
         recordReviewLogPublication({
@@ -1476,7 +1613,12 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         });
         activeReviewItem = null;
         completed += 1;
-        if (codexFailed) codexFailureReports.push(reportPath);
+        if (codexFailed) {
+          codexFailureReports.push({
+            path: outputSelection.retention === "none" ? null : reportPath,
+            kind: codexFailureLogKind(reportMarkdown),
+          });
+        }
         if (humanLocalReview) {
           console.error("");
           console.error(codexFailed ? "Codex review failed" : "Review complete");
@@ -1484,12 +1626,16 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           console.error(`  decision: ${decision.decision}`);
           console.error(`  confidence: ${decision.confidence}`);
           console.error(`  action: ${action.actionTaken}`);
-          console.error(`  report: ${displayPath(reportPath)}`);
+          if (outputSelection.retention !== "none") {
+            console.error(`  report: ${displayPath(reportPath)}`);
+          }
         } else {
           console.error(
             `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} done #${item.number} (${completed}/${candidates.length}) decision=${decision.decision} confidence=${decision.confidence} action=${action.actionTaken}`,
           );
         }
+        assertCurrentOutputBudget();
+        pruneItemOutput(reportPath);
         } catch (error) {
           reviewItemFailed = true;
           if (error instanceof AgentInputScanError || error instanceof ReviewSourcePreparationError) {
@@ -1536,15 +1682,15 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 reviewTreeCleanupFailures.push(detail);
                 console.error(`[review] ${new Date().toISOString()} ${detail}`);
               }
+              if (!reviewItemFailed) assertCurrentOutputBudget();
             }
           }
         }
       }
       if (coordinationHeldRetryAt) {
-        writeFileSync(
+        writeOutputMetadata(
           coordinationHeldPath,
           JSON.stringify({ retry_at: coordinationHeldRetryAt }, null, 2) + "\n",
-          "utf8",
         );
       }
       if (!humanLocalReview) {
@@ -1552,7 +1698,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} complete reviewed=${completed} cache_hits=${cacheHits} structural_cache_checks=${structuralCacheChecks} structural_cache_hits=${structuralCacheHits} structural_cache_revalidations=${structuralCacheRevalidations} content_cache_hits=${contentCacheHits} hydrations=${hydrationRuns}`,
         );
       }
-      writeFileSync(
+      writeOutputMetadata(
         join(artifactDir, "review-cache-metrics.json"),
         JSON.stringify(
           {
@@ -1582,7 +1728,6 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           null,
           2,
         ) + "\n",
-        "utf8",
       );
       if (leaseAcquisitionFailures > 0) {
         throw new Error(
@@ -1595,21 +1740,21 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         throw new Error(reviewTreeCleanupFailures.join("; "));
       }
       if (codexFailures > 0) {
-        for (const reportPath of codexFailureReports) {
-          const failureKind = codexFailureLogKind(readFileSync(reportPath, "utf8"));
+        for (const failure of codexFailureReports) {
           console.error(
-            `[review] ${new Date().toISOString()} codex-failure classification=${failureKind} report=${displayPath(reportPath)}`,
+            `[review] ${new Date().toISOString()} codex-failure classification=${failure.kind}${failure.path ? ` report=${displayPath(failure.path)}` : ""}`,
           );
         }
+        emitLocalOutput("failed");
+        const retainedFailureReports =
+          outputSelection.retention !== "none" && codexFailureReports.length > 0
+            ? ` Report${codexFailureReports.length === 1 ? "" : "s"}: ${codexFailureReports
+                .flatMap((failure) => (failure.path ? [displayPath(failure.path)] : []))
+                .join(", ")}`
+            : "";
         const message = `Codex failed for ${codexFailures} item${
           codexFailures === 1 ? "" : "s"
-        }; local failure reports were written and the workflow recovery lane can requeue evidence-backed retryable items.${
-          codexFailureReports.length > 0
-            ? ` Report${codexFailureReports.length === 1 ? "" : "s"}: ${codexFailureReports
-                .map(displayPath)
-                .join(", ")}`
-            : ""
-        }`;
+        }; the workflow recovery lane can requeue evidence-backed retryable items.${retainedFailureReports}`;
         if (humanLocalReview) throw new UserFacingCommandError(message);
         throw new Error(message);
       }
@@ -1618,7 +1763,11 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         completedCount: completed,
         cacheHits,
       });
+      reviewCompleted = true;
+      assertCurrentOutputBudget();
     } catch (error) {
+      commandError = error;
+      emitLocalOutput("failed");
       if (reviewLedger) {
         for (const acquired of acquiredReviewLeases) {
           const state = [...reviewLedger.items.values()].find(
@@ -1641,10 +1790,47 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           cacheHits,
         });
       }
+      if (outputEmitted && outputSelection.resultFormat === "json") {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = agentInputScanFailureExitCode(error) ?? 1;
+        return;
+      }
       throw error;
     } finally {
-      restoreTreeModes(readonlyModeSnapshots);
+      try {
+        restoreTreeModes(readonlyModeSnapshots);
+        if (outputSelection.retention === "summary") {
+          finalizeSummaryReviewOutput(
+            retainedReviewOutput!,
+            localOutputResults.flatMap((result) => (result.path ? [result.path] : [])),
+          );
+        }
+      } catch (error) {
+        if (commandError === undefined) finalizationError = error;
+        else
+          console.error(
+            `[review] summary output cleanup failed after command failure: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+      } finally {
+        try {
+          cleanupReviewOutput();
+        } catch (error) {
+          if (commandError === undefined && finalizationError === undefined) {
+            finalizationError = error;
+          } else {
+            console.error(
+              `[review] private output cleanup failed after an earlier failure: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
+      }
     }
+    if (finalizationError !== undefined) throw finalizationError;
+    if (reviewCompleted) emitLocalOutput("completed");
   }
 
   return { reviewCommand };

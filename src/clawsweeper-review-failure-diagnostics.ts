@@ -6,7 +6,8 @@ import { agentInputScanFailureReason } from "./exact-review-failure-reason.js";
 import { codexJsonlFailureDetail } from "./codex-transient.js";
 
 const FILE_LIMITS = { "error.txt": 4096, "stdout.error.txt": 4096, "stderr.tail.txt": 12_288 };
-const TOTAL_LIMIT = 24 * 1024;
+export const EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES = 24 * 1024;
+export const EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES = Object.keys(FILE_LIMITS).length + 1;
 const OMITTED = "[omitted: unsafe diagnostic content]\n";
 const SENSITIVE_NAME = String.raw`(?:ACCOUNT|ACTOR|AUTH|CODEX_HOME|COOKIE|CREDENTIAL|HOST|KEY|MODEL|PASSWORD|PRIVATE|PROVIDER|PROXY|RUNNER|SECRET|SESSION|TOKEN|USER|WEBHOOK)`;
 const ASSIGNMENT = new RegExp(
@@ -106,7 +107,11 @@ export function writeExactReviewFailureDiagnostics(options: {
   const total =
     Buffer.byteLength(manifest) +
     files.reduce((bytes, file) => bytes + Buffer.byteLength(file.content), 0);
-  if (total > TOTAL_LIMIT) throw new Error(`Exact-review diagnostics exceed ${TOTAL_LIMIT} bytes.`);
+  if (total > EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES) {
+    throw new Error(
+      `Exact-review diagnostics exceed ${EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES} bytes.`,
+    );
+  }
 
   const outputDir = join(options.artifactDir, "failure-diagnostics");
   const stagingDir = `${outputDir}.tmp-${process.pid}`;

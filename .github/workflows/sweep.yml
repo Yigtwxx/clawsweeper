@@ -1111,7 +1111,6 @@ jobs:
         with:
           target-repo: ${{ steps.target.outputs.target_repo }}
           target-dir: ${{ steps.target.outputs.target_checkout_dir }}
-          review-artifact-dir: ${{ github.workspace }}/artifacts/event
 
       - name: Mark re-review command in progress
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
@@ -1518,6 +1517,7 @@ jobs:
             rm -f "$refreshed_pull" "$refreshed_pull.ready"
             pnpm run review -- --target-repo "${{ steps.target.outputs.target_repo }}" \
               --artifact-dir artifacts/event --item-number "${{ steps.target.outputs.item_number }}" \
+              --output-retention debug \
               --review-lease-owner "$REVIEW_LEASE_OWNER" \
               --review-lease-comment-id "$REVIEW_LEASE_COMMENT_ID" \
               --skip-start-comment "${admission_args[@]}"
@@ -1553,6 +1553,7 @@ jobs:
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --target-dir "${{ steps.target.outputs.target_checkout_dir }}" \
             --artifact-dir artifacts/event \
+            --output-retention debug \
             --batch-size 1 \
             --max-pages 1 \
             --codex-model internal \
@@ -5087,7 +5088,6 @@ jobs:
         with:
           target-repo: ${{ needs.plan.outputs.target_repo }}
           target-dir: ${{ needs.plan.outputs.target_checkout_dir }}
-          review-artifact-dir: ${{ github.workspace }}/review-artifacts/shard-${{ matrix.shard }}
 
       - name: Mark shard start
         id: shard-start
@@ -5140,6 +5140,7 @@ jobs:
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --target-dir "../${{ needs.plan.outputs.target_checkout_dir }}" \
             --artifact-dir ../review-artifacts/shard-${{ matrix.shard }} \
+            --output-retention debug \
             --batch-size ${{ needs.plan.outputs.batch_size }} \
             --max-pages ${{ needs.plan.outputs.max_pages }} \
             --codex-model internal \

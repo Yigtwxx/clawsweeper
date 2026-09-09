@@ -8,10 +8,12 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { useFakeScanner } from "./agent-input-scan-helpers.ts";
 import { runAgentCheckoutInspection, runAgentProcess } from "../dist/agent-runner.js";
@@ -21,6 +23,7 @@ import { closeDecision, reviewFinding } from "./helpers.ts";
 import { AgentInputScanError, agentInputScanFailureExitCode } from "../dist/agent-input-scan.js";
 import { prepareOpenClawCodexSourceForReview } from "../dist/openclaw-codex-source.js";
 import { reviewStatusForDecision } from "../dist/clawsweeper-report-document.js";
+import { previousClawSweeperReviewFromComment } from "../dist/clawsweeper-review-comments.js";
 import { createContextHydration } from "../dist/clawsweeper-context-hydration.js";
 import { asRecord } from "../dist/clawsweeper-item-policy.js";
 import {
@@ -29,6 +32,7 @@ import {
   ReviewGitError,
 } from "../dist/clawsweeper-review-blobs.js";
 import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
+import { reviewOutputItemBudget } from "../dist/review-output-policy.js";
 
 import { parseArgs } from "../dist/clawsweeper-args.js";
 import {
@@ -249,14 +253,29 @@ const scheduledScenarios = [
   "changed-pr-clean",
   "changed-pr-proof-invalid-cursor",
   "changed-pr-proof-maintainer-change",
+  "changed-pr-partial-json-findings",
+  "changed-pr-partial-json-incomplete-source",
+  "changed-pr-partial-json-generic",
   "content-clean",
   "fresh-refusal",
 ];
 
-function testScheduledCacheScenario(scenario: string, publicationCase?: PublicationCacheCase) {
-  const name = publicationCase
-    ? `${scenario} publication policy ${publicationCase.name}`
-    : `scheduled ${scenario} preserves admission and terminal ledger classification`;
+interface OutputBudgetCase {
+  surface: "media" | "report" | "metadata" | "cumulative" | "history";
+  retention: "none" | "summary" | "debug";
+  localOnly: boolean;
+}
+
+function testScheduledCacheScenario(
+  scenario: string,
+  publicationCase?: PublicationCacheCase,
+  outputCase?: OutputBudgetCase,
+) {
+  const name = outputCase
+    ? `${scenario} ${outputCase.localOnly ? "local" : "hosted"} ${outputCase.retention} ${outputCase.surface} run admission`
+    : publicationCase
+      ? `${scenario} publication policy ${publicationCase.name}`
+      : `scheduled ${scenario} preserves admission and terminal ledger classification`;
   test(name, (t) => {
     const refuseScan = scenario.endsWith("refusal");
     const invalidProofPrior = scenario.startsWith("changed-pr-proof-");
@@ -274,6 +293,9 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
     const nativeCheckoutFailure = scenario.endsWith("native-checkout-failure");
     const checkoutUnavailable = scenario.endsWith("checkout-unavailable");
     const cacheRecovery = scenario === "structural-pr-checkout-recovery";
+    const partialJsonFailure = scenario.startsWith("changed-pr-partial-json-")
+      ? scenario.slice("changed-pr-partial-json-".length)
+      : null;
     const changedPr = scenario.startsWith("changed-pr-");
     const isPullRequest = changedPr || cacheRecovery;
     const fresh = scenario === "fresh-refusal" || changedPr;
@@ -286,6 +308,56 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
     const itemsDir = join(root, "items");
     const target = join(root, "target");
     mkdirSync(target);
+    const mediaCase = outputCase?.surface === "media";
+    const cumulativeCase = outputCase?.surface === "cumulative";
+    const twoItems = partialJsonFailure || mediaCase || cumulativeCase;
+    const oversized =
+      outputCase?.surface === "report"
+        ? "x".repeat((outputCase.retention === "debug" ? 64 : 16) * 1024 * 1024 + 1)
+        : cumulativeCase
+          ? "x".repeat(9 * 1024 * 1024)
+          : "";
+    const mediaCalls = join(root, "media-calls");
+    const tools = join(root, "tools");
+    if (mediaCase) {
+      mkdirSync(tools);
+      const tool = `#!${process.execPath}
+const fs = require("node:fs");
+const name = require("node:path").basename(process.argv[1]);
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(mediaCalls)}, name + "\\n");
+if (name === "ffprobe") process.stdout.write("{}");
+else {
+  const path = name === "curl" ? args[args.indexOf("--output") + 1] : args.at(-1);
+  const bytes = Number(args[args.indexOf(name === "curl" ? "--max-filesize" : "-fs") + 1]);
+  fs.writeFileSync(path, "");
+  fs.truncateSync(path, bytes);
+}
+`;
+      for (const name of ["curl", "ffprobe", "ffmpeg"]) {
+        writeFileSync(join(tools, name), tool, { mode: 0o700 });
+      }
+      if (outputCase.retention === "debug") {
+        mkdirSync(artifactDir);
+        const item = reviewOutputItemBudget("debug", 2);
+        const reserved =
+          2 *
+            (item.promptFileBytes +
+              item.resultFileBytes +
+              item.streamFileBytes * 2 +
+              item.threadStateBytes) +
+          item.metadataBytes +
+          item.reportsBytes;
+        const existing = join(artifactDir, "existing");
+        writeFileSync(existing, "");
+        truncateSync(existing, 1024 * 1024 * 1024 - reserved - 100);
+      }
+    }
+    const historyPath = join(artifactDir, `history-${ITEM_NUMBER}.md`);
+    if (outputCase?.surface === "history") {
+      mkdirSync(artifactDir);
+      writeFileSync(historyPath, "prior history");
+    }
     const git = (...args: string[]) =>
       execFileSync("git", args, { cwd: target, encoding: "utf8" }).trim();
     git("init", "-q");
@@ -327,7 +399,10 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
     const currentRecord = structuralRecord(RESERVED_AT, pull);
     const patch = "@@ -1 +1 @@\n-const value = 1;\n+const value = 2; // sensitive-comment-marker";
     const context = {
-      issue: { updatedAt: RESERVED_AT, body: fixtureQuote },
+      issue: {
+        updatedAt: RESERVED_AT,
+        body: mediaCase ? "https://example.test/proof.mp4" : fixtureQuote,
+      },
       sourceRevision: priorRecord.sourceRevision,
       comments: [],
       timeline: [],
@@ -393,7 +468,10 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       repo: REPO,
       number: ITEM_NUMBER,
       kind: isPullRequest ? ("pull_request" as const) : ("issue" as const),
-      title: `Scheduled cache proof. ${fixtureQuote}`,
+      title:
+        outputCase?.surface === "metadata"
+          ? "x".repeat(4 * 1024 * 1024 + 1)
+          : `Scheduled cache proof. ${fixtureQuote}`,
       url: `https://github.com/${REPO}/issues/${ITEM_NUMBER}`,
       createdAt: "2026-08-01T00:00:00Z",
       updatedAt: PRIOR_ACTIVITY_AT,
@@ -406,7 +484,7 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       created_at: RESERVED_AT,
       updated_at: RESERVED_AT,
     };
-    const priorMarkdown = `---\n${publicationCase?.cachedPolicy ?? ""}decision: keep_open\nreview_status: complete\n---\nCached review\n`;
+    const priorMarkdown = `---\n${publicationCase?.cachedPolicy ?? ""}decision: keep_open\nreview_status: complete\n---\nCached review\n${oversized}`;
     if (publicationCase) {
       mkdirSync(itemsDir);
       writeFileSync(join(itemsDir, `${ITEM_NUMBER}.md`), priorMarkdown);
@@ -420,6 +498,7 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
     let inspectedPrompt = "";
     let reviewTreeAttempts = 0;
     let reviewTreeCleanupCalls = 0;
+    const privateReviewRoots = new Set<string>();
     let blobMetadataCalls = 0;
     let earlyHydrationError: unknown;
     let activeReviewMutationRunner = null;
@@ -427,6 +506,7 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
     const oldEnv = process.env;
     process.env = {
       ...oldEnv,
+      ...(mediaCase ? { PATH: `${tools}:${oldEnv.PATH}` } : {}),
       CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
       CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-08-28",
       CLAWSWEEPER_ACTION_LEDGER_DISABLED: "0",
@@ -579,11 +659,13 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
         ];
       },
       frontMatterValue: (_markdown: string, key: string) =>
-        key === "review_activity_cursor"
-          ? scenario === "changed-pr-proof-invalid-cursor"
-            ? "unusable-cursor"
-            : `v2:0:${digest("activity")}`
-          : undefined,
+        outputCase?.surface === "history" && key === "review_status"
+          ? "complete"
+          : key === "review_activity_cursor"
+            ? scenario === "changed-pr-proof-invalid-cursor"
+              ? "unusable-cursor"
+              : `v2:0:${digest("activity")}`
+            : undefined,
       gitInfo: () => ({
         mainSha: "a".repeat(40),
         releaseStateComplete: true,
@@ -605,19 +687,25 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
       itemContentDigest: () => (changedPr ? digest("different-content") : digest("content")),
       extractLatestClawSweeperReview: () => context.previousClawSweeperReview,
+      extractClawSweeperReviewCommentBody: (body: string) =>
+        previousClawSweeperReviewFromComment(
+          { body },
+          { isClawSweeperComment: () => true, reviewCommentBodyDigest: digest },
+        ),
       fetchIssueReviewComments: () => [],
       pullHeadShaFromContext: (value) => value.pullRequest?.head.sha ?? null,
       reviewStructuralPullStateFromContext: () => pull,
       materializePullRequestReviewTree: ({ worktreeDir }) => {
+        privateReviewRoots.add(dirname(worktreeDir));
         reviewTreeAttempts += 1;
         if (checkoutUnavailable || (cacheRecovery && reviewTreeAttempts === 1)) return false;
         if (cacheRecovery) assert.equal(hydrationCalls, 1);
         if (nativeCheckoutFailure) {
-          const parent = join(root, "blocked-parent");
-          writeFileSync(parent, "a file cannot contain a worktree");
+          const commonGitDir = git("rev-parse", "--path-format=absolute", "--git-common-dir");
+          writeFileSync(join(commonGitDir, "worktrees"), "block Git worktree bookkeeping");
           return materializePullRequestReviewTree({
             targetDir: target,
-            worktreeDir: join(parent, "review-tree"),
+            worktreeDir,
             itemNumber: ITEM_NUMBER,
             headSha,
           });
@@ -634,6 +722,8 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
         return removePullRequestReviewTree(options);
       },
       localExactReviewItem: () => false,
+      localExactReviewHistoryPath: (directory, _repo, number) =>
+        join(directory, `history-${number}.md`),
       makeTreeReadOnly: () => [],
       postReviewStartStatusComment: () => {
         startCommentCalls += 1;
@@ -641,8 +731,9 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       },
       previousClawSweeperReviewDigestFromReport: () => digest("previous"),
       replaceFrontMatterValue,
+      renderReviewCommentFromReport: () => "x".repeat(4 * 1024 * 1024 + 1),
       repoFromArgs: () => ({ owner: "openclaw", repo: "openclaw" }),
-      reportFileName: () => `${ITEM_NUMBER}.md`,
+      reportFileName: (_repo, number) => `${number}.md`,
       reportReviewFindings: () => [],
       resolveReviewCheckout: () => ({ openclawDir: target }),
       restoreTreeModes: () => undefined,
@@ -686,9 +777,21 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
           });
         throw new Error("scan refusal must not become a decision");
       },
-      runCodex: ({ openclawDir, reviewEnv }) => {
+      runCodex: ({ item: reviewItem, openclawDir, reviewTreeRoot, reviewEnv, prompt }) => {
+        assert.equal(
+          prompt,
+          "Review the current item.",
+          "workflow supplies the runtime prompt; media fallback is unreachable",
+        );
         assert.equal(reviewEnv.GH_TOKEN, "synthetic-inspection-token");
         generationCalls += 1;
+        if (isPullRequest) {
+          assert.equal(reviewTreeRoot, realpathSync(dirname(openclawDir)));
+          assert.notEqual(reviewTreeRoot, join(artifactDir, "review-trees"));
+          const sibling = join(reviewTreeRoot, "codex");
+          if (!existsSync(sibling)) symlinkSync(target, sibling);
+          privateReviewRoots.add(reviewTreeRoot);
+        }
         if (cacheRecovery) {
           assert.equal(
             execFileSync("git", ["rev-parse", "HEAD"], {
@@ -701,7 +804,8 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
         if (preparationFailure) {
           prepareOpenClawCodexSourceForReview({
             targetRepo: REPO,
-            reviewDir: target,
+            reviewDir: openclawDir,
+            reviewTreeRoot,
             env: { CLAWSWEEPER_OPENCLAW_CODEX_SETUP_SCRIPT: "fixture-setup" },
           });
         }
@@ -723,6 +827,13 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
             env: { ...process.env, CODEX_BIN: provider },
             timeoutMs: 30_000,
           });
+        if (partialJsonFailure && reviewItem.number === ITEM_NUMBER + 1) {
+          if (partialJsonFailure === "findings") throw new AgentInputScanError("findings");
+          if (partialJsonFailure === "incomplete-source") {
+            throw new AgentInputScanError("incomplete_source");
+          }
+          throw new Error("generic second-item failure");
+        }
         assert.ok(
           isPullRequest || publicationCacheMiss,
           "compatible unchanged input must use the cache",
@@ -753,8 +864,20 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       verifyRegressionProvenance: (decision) => decision,
       reviewActionForDecision: () => ({ actionTaken: "none" }),
       markdownFor: ({ decision }) =>
-        `---\nreview_status: ${reviewStatusForDecision(decision)}\ndecision: keep_open\n---\nFresh Codex review\n${decision.reviewFindings.map((finding) => finding.title).join("\n")}\n`,
-      selectCandidates: () => ({ candidates: [{ ...item }], scannedPages: 1 }),
+        `---\nreview_status: ${reviewStatusForDecision(decision)}\ndecision: keep_open\n---\nFresh Codex review\n${decision.reviewFindings.map((finding) => finding.title).join("\n")}\n${oversized}`,
+      selectCandidates: () => ({
+        candidates: twoItems
+          ? [
+              { ...item },
+              {
+                ...item,
+                number: ITEM_NUMBER + 1,
+                url: `https://github.com/${REPO}/pull/${ITEM_NUMBER + 1}`,
+              },
+            ]
+          : [{ ...item }],
+        scannedPages: 1,
+      }),
       suppliedReviewStartLeaseFromArgs,
       targetRepo: () => REPO,
       updateBulkFilerDetectedFrontMatter: (markdown: string) => markdown,
@@ -763,33 +886,170 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
 
     try {
       const { reviewCommand } = createReviewCommandWorkflow(dependencies);
-      const execute = () =>
+      const execute = () => {
+        const commonArgs = [
+          "--target-repo",
+          REPO,
+          "--items-dir",
+          itemsDir,
+          "--item-numbers",
+          twoItems ? `${ITEM_NUMBER},${ITEM_NUMBER + 1}` : String(ITEM_NUMBER),
+          "--readonly-openclaw",
+        ];
         reviewCommand(
-          parseArgs([
-            "--target-repo",
-            REPO,
-            "--artifact-dir",
-            artifactDir,
-            "--items-dir",
-            itemsDir,
-            "--item-numbers",
-            String(ITEM_NUMBER),
-            "--readonly-openclaw",
-            "--skip-start-comment",
-            "--review-lease-owner",
-            LEASE_OWNER,
-            "--review-lease-comment-id",
-            String(LEASE_COMMENT_ID),
-            "--review-source-action",
-            invalidProofPrior ? "command_proof_result" : "scheduled_normal_backfill",
-            ...(invalidProofPrior
+          parseArgs(
+            outputCase
               ? [
-                  "--additional-prompt",
-                  `<!-- command-proof-assessment-v1 head=${headSha} body=${digest("body")} base=${digest("main")} base_sha=${baseSha} request=${digest("request")} scenario=web-ui-chat-proof -->\nProof assessment`,
+                  ...commonArgs,
+                  ...(outputCase.retention === "none" ? [] : ["--artifact-dir", artifactDir]),
+                  "--output-retention",
+                  outputCase.retention,
+                  "--skip-start-comment",
+                  ...(outputCase.localOnly ? ["--local-only"] : []),
+                  ...(!outputCase.localOnly && !fresh
+                    ? ["--review-source-action", "scheduled_normal_backfill"]
+                    : []),
+                  ...(cumulativeCase ? ["--result-format", "json"] : []),
+                  ...(mediaCase || outputCase.localOnly
+                    ? []
+                    : [
+                        "--review-lease-owner",
+                        LEASE_OWNER,
+                        "--review-lease-comment-id",
+                        String(LEASE_COMMENT_ID),
+                      ]),
                 ]
-              : []),
-          ]),
+              : partialJsonFailure
+                ? [...commonArgs, "--local-only", "--result-format", "json"]
+                : [
+                    ...commonArgs,
+                    "--artifact-dir",
+                    artifactDir,
+                    "--skip-start-comment",
+                    "--review-lease-owner",
+                    LEASE_OWNER,
+                    "--review-lease-comment-id",
+                    String(LEASE_COMMENT_ID),
+                    "--review-source-action",
+                    invalidProofPrior ? "command_proof_result" : "scheduled_normal_backfill",
+                    ...(invalidProofPrior
+                      ? [
+                          "--additional-prompt",
+                          `<!-- command-proof-assessment-v1 head=${headSha} body=${digest("body")} base=${digest("main")} base_sha=${baseSha} request=${digest("request")} scenario=web-ui-chat-proof -->\nProof assessment`,
+                        ]
+                      : []),
+                  ],
+          ),
         );
+      };
+
+      if (outputCase) {
+        if (cumulativeCase) {
+          const stdout: string[] = [];
+          const priorLog = console.log;
+          const priorError = console.error;
+          const priorExitCode = process.exitCode;
+          console.log = (value?: unknown) => stdout.push(String(value));
+          console.error = () => {};
+          process.exitCode = undefined;
+          try {
+            execute();
+            assert.equal(process.exitCode, 1);
+            assert.equal(generationCalls, 2);
+            assert.equal(stdout.length, 1);
+            const result = JSON.parse(stdout[0]!);
+            assert.equal(result.status, "failed");
+            assert.equal(result.retention, "none");
+            assert.equal(result.reports.length, 1);
+            assert.equal(result.reports[0].item_number, ITEM_NUMBER);
+            assert.ok(Buffer.byteLength(result.reports[0].report) < 16 * 1024 * 1024);
+          } finally {
+            console.log = priorLog;
+            console.error = priorError;
+            process.exitCode = priorExitCode;
+          }
+        } else if (outputCase.surface === "history") {
+          assert.throws(execute, /metadata exceeded/);
+          assert.equal(readFileSync(historyPath, "utf8"), "prior history");
+        } else if (mediaCase) {
+          execute();
+          assert.equal(generationCalls, 2);
+          const calls = readFileSync(mediaCalls, "utf8").trim().split("\n");
+          assert.deepEqual(
+            calls,
+            outputCase.retention === "debug"
+              ? ["curl", "ffprobe", "ffmpeg"]
+              : ["curl", "ffprobe", "ffmpeg", "curl", "ffprobe", "ffmpeg"],
+          );
+          if (outputCase.retention === "debug") {
+            assert.match(
+              readFileSync(
+                join(
+                  artifactDir,
+                  "codex",
+                  "proof-scratch",
+                  String(ITEM_NUMBER + 1),
+                  "media-proof-summary.md",
+                ),
+                "utf8",
+              ),
+              /exhausted/,
+            );
+          } else if (outputCase.retention === "summary") {
+            assert.equal(existsSync(join(artifactDir, "codex")), false);
+          }
+        } else {
+          assert.throws(execute, /(?:metadata|report).*exceeded.*byte limit/);
+          assert.equal(existsSync(join(artifactDir, `${ITEM_NUMBER}.md`)), false);
+          assert.equal(generationCalls, outputCase.surface === "metadata" || !fresh ? 0 : 1);
+          if (!fresh) {
+            assert.equal(hydrationCalls, contentPath ? 1 : 0);
+            assert.equal(checkoutInspectionCalls, 1);
+          }
+          if (outputCase.surface === "metadata") {
+            assert.equal(existsSync(join(artifactDir, "selection.json")), false);
+          }
+        }
+        return;
+      }
+
+      if (partialJsonFailure) {
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const priorLog = console.log;
+        const priorError = console.error;
+        const priorExitCode = process.exitCode;
+        console.log = (value?: unknown) => stdout.push(String(value));
+        console.error = (value?: unknown) => stderr.push(String(value));
+        process.exitCode = undefined;
+        try {
+          execute();
+          const expectedExit =
+            partialJsonFailure === "findings"
+              ? 79
+              : partialJsonFailure === "incomplete-source"
+                ? 78
+                : 1;
+          assert.equal(process.exitCode, expectedExit);
+          assert.equal(stdout.length, 1, stdout.join("\n"));
+          const result = JSON.parse(stdout[0]!);
+          assert.equal(result.status, "failed");
+          assert.equal(result.retention, "none");
+          assert.match(
+            result.reports.find(
+              (report: { item_number?: number }) => report.item_number === ITEM_NUMBER,
+            )?.report ?? "",
+            /Fresh Codex review/,
+          );
+          assert.equal(stdout[0]!.includes("[review]"), false);
+          assert.ok(stderr.length > 0);
+        } finally {
+          console.log = priorLog;
+          console.error = priorError;
+          process.exitCode = priorExitCode;
+        }
+        return;
+      }
 
       if (refuseScan) {
         const reason = incompleteSource ? "incomplete_source" : "scanner_failed";
@@ -878,7 +1138,8 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
         if (nativeFailure) {
           assert.ok(Number.isInteger(manifest.process.status) && manifest.process.status > 0);
           const detail = readFileSync(join(output, "stderr.tail.txt"), "utf8");
-          assert.match(detail, /REDACTED_PATH/);
+          if (fetchFailure) assert.match(detail, /REDACTED_PATH/);
+          else assert.match(detail, /\.git\/worktrees\/[^\r\n]+Not a directory/);
           assert.equal(detail.includes(root), false);
         } else {
           assert.equal(manifest.process.status, null);
@@ -1012,12 +1273,58 @@ function testScheduledCacheScenario(scenario: string, publicationCase?: Publicat
       assert.equal(metrics.content_cache_hits, hydrated ? 1 : 0);
       assert.equal(metrics.hydrations, hydrated ? 1 : 0);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      try {
+        for (const privateRoot of privateReviewRoots) {
+          assert.equal(
+            existsSync(privateRoot),
+            false,
+            "command must remove its private sibling root",
+          );
+        }
+        assert.equal(existsSync(join(target, "value.ts")), true, "sibling target remains intact");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 }
 
 for (const scenario of scheduledScenarios) testScheduledCacheScenario(scenario);
+
+for (const retention of ["none", "summary", "debug"] as const) {
+  testScheduledCacheScenario("changed-pr-clean", undefined, {
+    surface: "media",
+    retention,
+    localOnly: true,
+  });
+  testScheduledCacheScenario("changed-pr-clean", undefined, {
+    surface: "report",
+    retention,
+    localOnly: true,
+  });
+}
+testScheduledCacheScenario("changed-pr-clean", undefined, {
+  surface: "cumulative",
+  retention: "none",
+  localOnly: true,
+});
+testScheduledCacheScenario("changed-pr-clean", undefined, {
+  surface: "history",
+  retention: "debug",
+  localOnly: true,
+});
+for (const scenario of ["structural-clean", "content-clean", "changed-pr-clean"]) {
+  testScheduledCacheScenario(scenario, undefined, {
+    surface: "report",
+    retention: "debug",
+    localOnly: false,
+  });
+}
+testScheduledCacheScenario("changed-pr-clean", undefined, {
+  surface: "metadata",
+  retention: "debug",
+  localOnly: false,
+});
 
 for (const path of ["structural-clean", "content-clean"]) {
   for (const currentPolicy of [undefined, "record_comment_only"] as const) {

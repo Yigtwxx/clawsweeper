@@ -494,7 +494,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
       action: "./.github/actions/setup-openclaw-codex-source",
       targetRepo: "${{ steps.target.outputs.target_repo }}",
       targetDir: "${{ steps.target.outputs.target_checkout_dir }}",
-      artifactDir: "${{ github.workspace }}/artifacts/event",
       reviewStep: "Review exact event item",
     },
     {
@@ -502,7 +501,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
       action: "./clawsweeper/.github/actions/setup-openclaw-codex-source",
       targetRepo: "${{ needs.plan.outputs.target_repo }}",
       targetDir: "${{ needs.plan.outputs.target_checkout_dir }}",
-      artifactDir: "${{ github.workspace }}/review-artifacts/shard-${{ matrix.shard }}",
       reviewStep: "Review shard",
     },
   ] as const) {
@@ -519,7 +517,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
     assert.deepEqual(steps[sourceCheckout]!.with, {
       "target-repo": scenario.targetRepo,
       "target-dir": scenario.targetDir,
-      "review-artifact-dir": scenario.artifactDir,
     });
   }
 });
@@ -7498,6 +7495,7 @@ test("exact oversized PR admission uses the built predicate before reactions, re
     review.run.indexOf('if [ "$OVERSIZED_PR" = "true" ]; then'),
     review.run.indexOf('codex_timeout_ms="'),
   );
+  assert.match(oversizedBranch, /--output-retention debug/);
   assert.match(oversizedBranch, /--review-lease-owner "\$REVIEW_LEASE_OWNER"/);
   assert.match(oversizedBranch, /--review-lease-comment-id "\$REVIEW_LEASE_COMMENT_ID"/);
   for (const reservation of ["posted", "held", "superseded", ""]) {
