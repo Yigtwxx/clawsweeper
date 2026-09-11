@@ -134,9 +134,10 @@ ${childIgnoresSigterm ? 'process.on("SIGTERM", () => {});' : ""}
 const announce = () => {
   if (!fs.existsSync(readyPath)) return setTimeout(announce, 10);
   fs.writeFileSync(
-    process.env.OPENCLAW_PROOF_PID_PATH,
+    process.env.OPENCLAW_PROOF_PID_PATH + ".tmp",
     JSON.stringify({ child: process.pid, grandchild: grandchild.pid }),
   );
+  fs.renameSync(process.env.OPENCLAW_PROOF_PID_PATH + ".tmp", process.env.OPENCLAW_PROOF_PID_PATH);
 };
 announce();
 setInterval(() => {}, 1000);

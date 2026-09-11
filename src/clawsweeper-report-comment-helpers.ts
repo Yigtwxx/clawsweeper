@@ -1,3 +1,7 @@
+import {
+  oversizedPullRequestComment,
+  parseOversizedPullRequestEvidence,
+} from "./clawsweeper-oversized-pr-policy.js";
 import type {
   AgentsPolicyStatus,
   CloseReason,
@@ -183,6 +187,14 @@ export function createReportCommentHelpers(
   }
 
   function renderCloseCommentFromReport(markdown: string, reason: CloseReason): string {
+    if (reason === "oversized_pull_request") {
+      const size = parseOversizedPullRequestEvidence(
+        frontMatterValue(markdown, "oversized_pull_request"),
+      );
+      return size
+        ? oversizedPullRequestComment(size, frontMatterValue(markdown, "action_taken") === "closed")
+        : "";
+    }
     return neutralizeReviewControlMarkers(
       sanitizePublicSelfReferences(
         renderCloseComment({
@@ -243,6 +255,10 @@ export function createReportCommentHelpers(
     runtime?: Pick<ReviewRuntime, "model" | "reasoningEffort">,
     item?: { repo?: string; kind?: ItemKind; number?: number },
   ): string {
+    if (decision.closeReason === "oversized_pull_request") {
+      const size = parseOversizedPullRequestEvidence(decision.oversizedPullRequest);
+      return size ? oversizedPullRequestComment(size) : "";
+    }
     return renderCloseComment({
       reason: decision.closeReason,
       summary: decision.summary,
@@ -841,9 +857,11 @@ export function createReportCommentHelpers(
     return [collapsedDetailsBlock("How this review workflow works", reviewWorkflowLines()), ""];
   }
 
-  function reviewFreshnessText(markdown: string): string {
+  function reviewFreshnessText(markdown: string, revision?: number): string {
     const timestamp = formatReviewFreshnessTimestamp(frontMatterValue(markdown, "reviewed_at"));
-    return timestamp ? ` _Reviewed ${timestamp}._` : "";
+    if (!timestamp) return "";
+    const revisionSuffix = revision !== undefined && revision >= 2 ? ` (Revision ${revision})` : "";
+    return ` _Reviewed ${timestamp}${revisionSuffix}._`;
   }
 
   const REVIEW_HISTORY_RENDER_SLOT = "CLAWSWEEPER_REVIEW_HISTORY_RENDER_SLOT";

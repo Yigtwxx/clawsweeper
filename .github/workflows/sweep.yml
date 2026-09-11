@@ -234,6 +234,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CLAWSWEEPER_AUTO_CLOSE_REASONS: ${{ vars.CLAWSWEEPER_AUTO_CLOSE_REASONS || 'all' }}
   CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED || 'false' }}
+  CLAWSWEEPER_OVERSIZED_PR_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_OVERSIZED_PR_CLOSE_ENABLED || 'true' }}
+  CLAWSWEEPER_MAX_PR_CHANGED_LINES: ${{ vars.CLAWSWEEPER_MAX_PR_CHANGED_LINES || '50000' }}
   CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
   CLAWSWEEPER_STALE_VERSION_BUG_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_STALE_VERSION_BUG_CLOSE_ENABLED || 'false' }}
   CLAWSWEEPER_OBSOLETE_FIX_PR_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_OBSOLETE_FIX_PR_CLOSE_ENABLED || 'false' }}
@@ -281,6 +283,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
       - name: Enqueue legacy event through the durable control plane
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
@@ -288,6 +298,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           mapfile -d '' -t legacy_intake_fields < <(node <<'NODE'
@@ -459,7 +470,7 @@ jobs:
           NODE
           )"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -482,6 +493,14 @@ jobs:
       pull-requests: read
       statuses: read
     steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
       - name: Claim exact-review queue lease
         id: claim-exact-review-queue
         env:
@@ -493,6 +512,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           test -n "$QUEUE_LEASE_ID"
           printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
           queue_url="${QUEUE_URL%/}"
@@ -514,163 +534,155 @@ jobs:
             }));
           ')"
           response_file="$(mktemp)"
-          error_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$error_file"' EXIT
-          for attempt in 1 2 3; do
-            : > "$response_file"
-            : > "$error_file"
-            if status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --request POST \
-              --header "content-type: application/json" \
-              --data "$payload" \
-              "$queue_url/internal/exact-review/claim" 2>"$error_file")"; then
-              response="$(<"$response_file")"
-              if [ "$status" = "409" ]; then
-                conflict_reason="$(RESPONSE="$response" node <<'NODE'
-                  const response = JSON.parse(process.env.RESPONSE || "{}");
-                  const safeConflicts = new Set([
-                    "lease_not_active",
-                    "lease_already_claimed",
-                    "lease_decision_unavailable",
-                    "stale_run_attempt",
-                  ]);
-                  if (!safeConflicts.has(response.error)) process.exit(1);
-                  process.stdout.write(response.error);
-          NODE
-                )" || {
-                  echo "Unexpected exact-review lease conflict: $response" >&2
-                  exit 1
-                }
-                echo "::notice::Skipping exact review because lease claim lost safely: $conflict_reason"
-                exit 0
-              fi
-              if [ "$status" != "200" ]; then
-                if [[ "$status" != 5* ]]; then
-                  echo "Exact-review lease claim returned HTTP $status: $response" >&2
-                  exit 1
-                fi
-              elif RESPONSE="$response" node <<'NODE'
-                const fs = require("node:fs");
+          trap 'rm -f "$response_file"' EXIT
+          : > "$response_file"
+          if status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/claim")"; then
+            response="$(<"$response_file")"
+            if [ "$status" = "409" ]; then
+              conflict_reason="$(RESPONSE="$response" node <<'NODE'
                 const response = JSON.parse(process.env.RESPONSE || "{}");
-                const dispatch = JSON.parse(process.env.DISPATCH_PAYLOAD || "{}");
-                const requestedItemKey = String(process.env.ITEM_KEY || "").trim();
-                const requestedLeaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
-                const responseProtocol = Number(response.protocol_version || 1);
-                if (responseProtocol !== 1 && responseProtocol !== 2) process.exit(1);
-                if (response.claimed !== true) process.exit(1);
-
-                const reviewOptions =
-                  dispatch.review_options && typeof dispatch.review_options === "object"
-                    ? dispatch.review_options
-                    : {};
-                const legacyDecision = {
-                  targetRepo: String(dispatch.target_repo || ""),
-                  targetBranch: String(dispatch.target_branch || "main"),
-                  itemNumber: Number(dispatch.item_number),
-                  itemKind: String(dispatch.item_kind || ""),
-                  sourceEvent: String(dispatch.source_event || ""),
-                  sourceAction: String(dispatch.source_action || "legacy_dispatch"),
-                  supersedesInProgress: dispatch.supersedes_in_progress === true,
-                  ...(/^[0-9a-f]{40}$/.test(String(dispatch.queue_claim?.source_head_sha || dispatch.source_head_sha || "").trim().toLowerCase())
-                    ? { sourceHeadSha: String(dispatch.queue_claim?.source_head_sha || dispatch.source_head_sha).trim().toLowerCase() }
-                    : {}),
-                  ...(Number.isFinite(Number(reviewOptions.codex_timeout_ms))
-                    ? { codexTimeoutMs: Number(reviewOptions.codex_timeout_ms) }
-                    : {}),
-                  ...(Number.isFinite(Number(reviewOptions.media_proof_timeout_ms))
-                    ? { mediaProofTimeoutMs: Number(reviewOptions.media_proof_timeout_ms) }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "command_status_marker")
-                    ? { commandStatusMarker: reviewOptions.command_status_marker }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "status_comment_id")
-                    ? { statusCommentId: reviewOptions.status_comment_id }
-                    : {}),
-                  ...(Number.isSafeInteger(
-                    Number(reviewOptions.review_acknowledgement_comment_id),
-                  ) && Number(reviewOptions.review_acknowledgement_comment_id) > 0
-                    ? {
-                        reviewAcknowledgementCommentId: Number(
-                          reviewOptions.review_acknowledgement_comment_id,
-                        ),
-                      }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "additional_prompt")
-                    ? { additionalPrompt: reviewOptions.additional_prompt }
-                    : {}),
-                };
-                const decision =
-                  response.decision && typeof response.decision === "object"
-                    ? response.decision
-                    : legacyDecision;
-                const targetRepo = String(decision?.targetRepo || "");
-                const itemNumber = Number(decision?.itemNumber);
-                const itemKey = `${targetRepo}#${itemNumber}`;
-                const leaseRevision =
-                  responseProtocol === 2
-                    ? Number(response.lease_revision)
-                    : Number(
-                        response.revision ||
-                          response.lease_revision ||
-                          process.env.QUEUE_LEASE_REVISION,
-                      );
-                const claimGeneration = Number(response.claim_generation);
-                const repeatRevision = response.repeat_revision;
-                if (
-                  !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
-                  !Number.isInteger(itemNumber) ||
-                  itemNumber < 1 ||
-                  (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
-                  (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
-                  typeof decision.sourceAction !== "string" ||
-                  !decision.sourceAction
-                ) {
-                  process.exit(1);
-                }
-                if (response.item_key && response.item_key !== itemKey) process.exit(1);
-                if (requestedItemKey && requestedItemKey !== itemKey) process.exit(1);
-                if (
-                  responseProtocol === 2 &&
-                  (!response.decision ||
-                    typeof response.decision !== "object" ||
-                    response.item_key !== requestedItemKey ||
-                    response.lease_revision !== requestedLeaseRevision ||
-                    !Number.isInteger(claimGeneration) ||
-                    claimGeneration < 1 ||
-                    typeof repeatRevision !== "boolean")
-                ) {
-                  process.exit(1);
-                }
-                const output = [
-                  "claimed=true",
-                  `lease_id=${process.env.QUEUE_LEASE_ID}`,
-                  `item_key=${itemKey}`,
-                  `lease_revision=${Number.isInteger(leaseRevision) ? leaseRevision : ""}`,
-                  `claim_generation=${responseProtocol === 2 ? claimGeneration : ""}`,
-                  `repeat_revision=${responseProtocol === 2 ? repeatRevision : false}`,
-                  `protocol_version=${responseProtocol}`,
-                  `decision=${JSON.stringify(decision)}`,
-                ];
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `${output.join("\n")}\n`);
+                const safeConflicts = new Set([
+                  "lease_not_active",
+                  "lease_already_claimed",
+                  "lease_decision_unavailable",
+                  "stale_run_attempt",
+                ]);
+                if (!safeConflicts.has(response.error)) process.exit(1);
+                process.stdout.write(response.error);
           NODE
-              then
-                exit 0
-              else
-                echo "Exact-review lease claim returned an invalid success payload." >&2
+              )" || {
+                echo "Unexpected exact-review lease conflict: $response" >&2
+                exit 1
+              }
+              echo "::notice::Skipping exact review because lease claim lost safely: $conflict_reason"
+              exit 0
+            fi
+            if [ "$status" != "200" ]; then
+              if [[ "$status" != 5* ]]; then
+                echo "Exact-review lease claim returned HTTP $status: $response" >&2
                 exit 1
               fi
+            elif RESPONSE="$response" node <<'NODE'
+              const fs = require("node:fs");
+              const response = JSON.parse(process.env.RESPONSE || "{}");
+              const dispatch = JSON.parse(process.env.DISPATCH_PAYLOAD || "{}");
+              const requestedItemKey = String(process.env.ITEM_KEY || "").trim();
+              const requestedLeaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
+              const responseProtocol = Number(response.protocol_version || 1);
+              if (responseProtocol !== 1 && responseProtocol !== 2) process.exit(1);
+              if (response.claimed !== true) process.exit(1);
+
+              const reviewOptions =
+                dispatch.review_options && typeof dispatch.review_options === "object"
+                  ? dispatch.review_options
+                  : {};
+              const legacyDecision = {
+                targetRepo: String(dispatch.target_repo || ""),
+                targetBranch: String(dispatch.target_branch || "main"),
+                itemNumber: Number(dispatch.item_number),
+                itemKind: String(dispatch.item_kind || ""),
+                sourceEvent: String(dispatch.source_event || ""),
+                sourceAction: String(dispatch.source_action || "legacy_dispatch"),
+                supersedesInProgress: dispatch.supersedes_in_progress === true,
+                ...(/^[0-9a-f]{40}$/.test(String(dispatch.queue_claim?.source_head_sha || dispatch.source_head_sha || "").trim().toLowerCase())
+                  ? { sourceHeadSha: String(dispatch.queue_claim?.source_head_sha || dispatch.source_head_sha).trim().toLowerCase() }
+                  : {}),
+                ...(Number.isFinite(Number(reviewOptions.codex_timeout_ms))
+                  ? { codexTimeoutMs: Number(reviewOptions.codex_timeout_ms) }
+                  : {}),
+                ...(Number.isFinite(Number(reviewOptions.media_proof_timeout_ms))
+                  ? { mediaProofTimeoutMs: Number(reviewOptions.media_proof_timeout_ms) }
+                  : {}),
+                ...(Object.hasOwn(reviewOptions, "command_status_marker")
+                  ? { commandStatusMarker: reviewOptions.command_status_marker }
+                  : {}),
+                ...(Object.hasOwn(reviewOptions, "status_comment_id")
+                  ? { statusCommentId: reviewOptions.status_comment_id }
+                  : {}),
+                ...(Number.isSafeInteger(
+                  Number(reviewOptions.review_acknowledgement_comment_id),
+                ) && Number(reviewOptions.review_acknowledgement_comment_id) > 0
+                  ? {
+                      reviewAcknowledgementCommentId: Number(
+                        reviewOptions.review_acknowledgement_comment_id,
+                      ),
+                    }
+                  : {}),
+                ...(Object.hasOwn(reviewOptions, "additional_prompt")
+                  ? { additionalPrompt: reviewOptions.additional_prompt }
+                  : {}),
+              };
+              const decision =
+                response.decision && typeof response.decision === "object"
+                  ? response.decision
+                  : legacyDecision;
+              const targetRepo = String(decision?.targetRepo || "");
+              const itemNumber = Number(decision?.itemNumber);
+              const itemKey = `${targetRepo}#${itemNumber}`;
+              const leaseRevision =
+                responseProtocol === 2
+                  ? Number(response.lease_revision)
+                  : Number(
+                      response.revision ||
+                        response.lease_revision ||
+                        process.env.QUEUE_LEASE_REVISION,
+                    );
+              const claimGeneration = Number(response.claim_generation);
+              const repeatRevision = response.repeat_revision;
+              if (
+                !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
+                !Number.isInteger(itemNumber) ||
+                itemNumber < 1 ||
+                (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
+                (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
+                typeof decision.sourceAction !== "string" ||
+                !decision.sourceAction
+              ) {
+                process.exit(1);
+              }
+              if (response.item_key && response.item_key !== itemKey) process.exit(1);
+              if (requestedItemKey && requestedItemKey !== itemKey) process.exit(1);
+              if (
+                responseProtocol === 2 &&
+                (!response.decision ||
+                  typeof response.decision !== "object" ||
+                  response.item_key !== requestedItemKey ||
+                  response.lease_revision !== requestedLeaseRevision ||
+                  !Number.isInteger(claimGeneration) ||
+                  claimGeneration < 1 ||
+                  typeof repeatRevision !== "boolean")
+              ) {
+                process.exit(1);
+              }
+              const output = [
+                "claimed=true",
+                `lease_id=${process.env.QUEUE_LEASE_ID}`,
+                `item_key=${itemKey}`,
+                `lease_revision=${Number.isInteger(leaseRevision) ? leaseRevision : ""}`,
+                `claim_generation=${responseProtocol === 2 ? claimGeneration : ""}`,
+                `repeat_revision=${responseProtocol === 2 ? repeatRevision : false}`,
+                `protocol_version=${responseProtocol}`,
+                `decision=${JSON.stringify(decision)}`,
+              ];
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `${output.join("\n")}\n`);
+          NODE
+            then
+              exit 0
             else
-              cat "$error_file" >&2
+              echo "Exact-review lease claim returned an invalid success payload." >&2
+              exit 1
             fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
+          fi
           exit 1
 
       - uses: actions/checkout@v7
+        id: source-checkout
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
         with:
           filter: blob:none
@@ -770,6 +782,12 @@ jobs:
           permission-pull-requests: read
           permission-statuses: read
 
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' }}
+        with:
+          build-script: build:all
+
       - name: Check live target item state
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' }}
         id: live-item
@@ -862,15 +880,39 @@ jobs:
           live_locked="$(jq -r '.locked == true' <<< "$live_item")"
           item_kind="$(jq -r 'if .pull_request then "pull_request" else "issue" end' <<< "$live_item")"
           echo "item_kind=$item_kind" >> "$GITHUB_OUTPUT"
+          live_head_sha=""
+          if [ "$live_state" = "open" ] && [ "$live_locked" != "true" ] && [ "$item_kind" = "pull_request" ]; then
+            pull_observed_at="$(node -e 'process.stdout.write(new Date().toISOString())')"
+            if live_pull="$(gh api "repos/$TARGET_REPO/pulls/$ITEM_NUMBER")"; then
+            live_head_sha="$(jq -r '.head.sha // empty' <<< "$live_pull")"
+            mkdir -p .artifacts
+            jq -n --arg repo "$TARGET_REPO" --arg observedAt "$pull_observed_at" --argjson pull "$live_pull" '{repo: $repo, pull: $pull, observedAt: $observedAt}' > .artifacts/exact-pr-admission.json
+            oversized="$(node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { oversizedPullRequestAdmission } from "./dist/clawsweeper-oversized-pr-policy.js";
+          const { pull } = JSON.parse(readFileSync(".artifacts/exact-pr-admission.json", "utf8"));
+          process.stdout.write(String(!oversizedPullRequestAdmission(pull).admitted));
+          NODE
+          )"
+            echo "pr_admission_file=.artifacts/exact-pr-admission.json" >> "$GITHUB_OUTPUT"
+            echo "oversized=$oversized" >> "$GITHUB_OUTPUT"
+            if [ "$oversized" = "true" ]; then
+              {
+                echo "proceed=true"
+                echo "scheduled_semantic_noop=false"
+                echo "terminal_noop=false"
+                echo "terminal_missing=false"
+                echo "guarded_open=false"
+                echo "guarded_open_action="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            else
+              echo "::warning::Unable to read PR admission metadata; preserving normal review admission."
+            fi
+          fi
           if [ "$live_state" = "open" ] && [ "$live_locked" != "true" ] &&
             jq -e '.sourceAction == "scheduled_hot_intake"' <<< "$CLAIM_DECISION" >/dev/null; then
-            live_head_sha=""
-            if [ "$item_kind" = "pull_request" ]; then
-              if ! live_head_sha="$(gh api "repos/$TARGET_REPO/pulls/$ITEM_NUMBER" --jq '.head.sha')"; then
-                echo "::warning::Unable to read the live pull request head; preserving normal review admission."
-                live_head_sha=""
-              fi
-            fi
             comments_error="$(mktemp)"
             if live_comments="$(gh api --paginate --slurp "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments?per_page=100" 2>"$comments_error" | jq 'add')"; then
               classification_output="$(mktemp)"
@@ -950,7 +992,7 @@ jobs:
 
       - name: Resolve automatic review status comment
         id: automatic-review-status
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.has_command_context != 'true' && fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind == 'pull_request' && steps.target-write-token.outputs.token != '' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.has_command_context != 'true' && steps.live-item.outputs.oversized != 'true' && fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind == 'pull_request' && steps.target-write-token.outputs.token != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -994,7 +1036,7 @@ jobs:
           fi
 
       - name: React to target item review start
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -1022,14 +1064,8 @@ jobs:
           }
           react "eyes"
 
-      - uses: ./.github/actions/setup-pnpm
-        id: setup-pnpm
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outcome == 'success' && steps.live-item.outputs.scheduled_semantic_noop != 'true' && steps.live-item.outputs.admission_retry != 'true' }}
-        with:
-          build-script: ${{ steps.live-item.outputs.proceed == 'true' && 'build:all' || 'build:repair' }}
-
       - uses: actions/cache@v6
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         with:
           path: ${{ steps.target.outputs.target_checkout_dir }}-cache.git
           key: ${{ steps.target.outputs.target_repo_name }}-event-git-${{ runner.os }}-${{ github.run_id }}
@@ -1038,7 +1074,7 @@ jobs:
             ${{ steps.target.outputs.target_repo_name }}-git-${{ runner.os }}-
 
       - name: Check out target repository
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         run: |
           set -euo pipefail
           url="https://github.com/${{ steps.target.outputs.target_repo }}.git"
@@ -1071,14 +1107,13 @@ jobs:
           git -C "$checkout_dir" rev-parse --short HEAD
 
       - uses: ./.github/actions/setup-openclaw-codex-source
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         with:
           target-repo: ${{ steps.target.outputs.target_repo }}
           target-dir: ${{ steps.target.outputs.target_checkout_dir }}
-          review-artifact-dir: ${{ github.workspace }}/artifacts/event
 
       - name: Mark re-review command in progress
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -1099,7 +1134,7 @@ jobs:
             --wait-ms 120000
 
       - uses: ./.github/actions/setup-codex
-        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
         env:
           OPENAI_API_KEY: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
           CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.CLAWSWEEPER_MODEL || '' }}
@@ -1110,7 +1145,7 @@ jobs:
           review-network: "true"
 
       - uses: ./.github/actions/setup-openclaw
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
 
       - name: Reserve exact review lease
         id: reserve-exact-review-lease
@@ -1234,6 +1269,7 @@ jobs:
           REVIEW_ACKNOWLEDGEMENT_COMMENT_ID: ${{ steps.automatic-review-status.outputs.status_comment_id }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           echo "authorized=false" >> "$GITHUB_OUTPUT"
           payload="$(node -e '
             const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
@@ -1251,7 +1287,7 @@ jobs:
           ')"
           response="$(mktemp)"
           trap 'rm -f "$response"' EXIT
-          status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --output "$response" --write-out '%{http_code}' --request POST \
             --header "content-type: application/json" --data-binary "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
@@ -1292,6 +1328,7 @@ jobs:
           EXACT_REVIEW_SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           echo "authorized=false" >> "$GITHUB_OUTPUT"
           payload="$(node -e '
             const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
@@ -1308,7 +1345,7 @@ jobs:
           ')"
           response="$(mktemp)"
           trap 'rm -f "$response"' EXIT
-          status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --output "$response" --write-out '%{http_code}' --request POST \
             --header "content-type: application/json" --data-binary "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
@@ -1325,6 +1362,8 @@ jobs:
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' && (steps.review-status-fence.outcome == 'skipped' || (steps.review-status-fence.outputs.authorized == 'true' && steps.release-review-status-fence.outputs.authorized == 'true')) }}
         continue-on-error: true
         env:
+          PR_ADMISSION_FILE: ${{ steps.live-item.outputs.pr_admission_file }}
+          OVERSIZED_PR: ${{ steps.live-item.outputs.oversized }}
           # Review hydration is the largest read stream (~30 calls/review); it
           # stays on the App installation bucket so the per-repo Actions pool
           # keeps headroom for the comment-router and support lanes.
@@ -1345,6 +1384,7 @@ jobs:
           EXACT_REVIEW_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           test -n "$GH_TOKEN"
           heartbeat_pid=""
           review_pid=""
@@ -1375,13 +1415,13 @@ jobs:
           }
           heartbeat_loop() {
             while true; do
-              heartbeat_status="$(curl --silent --connect-timeout 5 --max-time 20 \
+              heartbeat_status="$(control_plane_curl --silent --connect-timeout 5 --max-time 20 \
                 --output /dev/null \
                 --write-out '%{http_code}' \
                 --request POST \
                 --header "content-type: application/json" \
                 --data-binary "$heartbeat_payload" \
-                "${QUEUE_URL%/}/internal/exact-review/heartbeat" 2>/dev/null)" || heartbeat_status=""
+                "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || heartbeat_status=""
               if [ "$heartbeat_status" = "409" ]; then
                 echo "::notice::Exact-review heartbeat lost its lease tuple."
                 : > "$superseded_marker"
@@ -1427,30 +1467,72 @@ jobs:
               const payload = JSON.parse(process.env.HEARTBEAT_PAYLOAD || "{}");
               process.stdout.write(JSON.stringify({ ...payload, phase: "finalizing" }));
             ')" || return 1
-            for attempt in 1 2 3; do
-              finalizing_status="$(curl --silent --connect-timeout 5 --max-time 20 \
-                --output /dev/null \
-                --write-out '%{http_code}' \
-                --request POST \
-                --header "content-type: application/json" \
-                --data-binary "$finalizing_payload" \
-                "${QUEUE_URL%/}/internal/exact-review/heartbeat" 2>/dev/null)" || finalizing_status=""
-              if [ "$finalizing_status" = "200" ]; then
-                return 0
-              fi
-              if [ "$finalizing_status" = "409" ]; then
-                echo "::notice::Exact-review finalization lost its lease tuple."
-                : > "$superseded_marker"
-                return 0
-              fi
-              if [ "$attempt" -lt 3 ]; then
-                sleep "$((attempt * 5))"
-              fi
-            done
+            finalizing_status="$(control_plane_curl --silent --connect-timeout 5 --max-time 20 \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "content-type: application/json" \
+              --data-binary "$finalizing_payload" \
+              "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || finalizing_status=""
+            if [ "$finalizing_status" = "200" ]; then
+              return 0
+            fi
+            if [ "$finalizing_status" = "409" ]; then
+              echo "::notice::Exact-review finalization lost its lease tuple."
+              : > "$superseded_marker"
+              return 0
+            fi
+            echo "control_plane_unavailable=true" >> "$GITHUB_OUTPUT"
             echo "::error::Exact-review lease could not enter finalization."
             return 1
           }
           trap cleanup_heartbeat EXIT
+          admission_args=()
+          if [ -n "$PR_ADMISSION_FILE" ]; then
+            admission_args=(--pr-admission-file "$PR_ADMISSION_FILE")
+          fi
+          if [ "$OVERSIZED_PR" = "true" ]; then
+            # GitHub updated_at has one-second granularity; let the reservation write precede the fresh observation and its clock margin.
+            sleep 2
+            admission_observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            refreshed_pull="$(mktemp)"
+            gh api "repos/${{ steps.target.outputs.target_repo }}/pulls/${{ steps.target.outputs.item_number }}" > "$refreshed_pull"
+            REFRESHED_PULL="$refreshed_pull" ADMISSION_OBSERVED_AT="$admission_observed_at" node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+            import { oversizedPullRequestAdmission } from './dist/clawsweeper-oversized-pr-policy.js';
+            const prior = JSON.parse(fs.readFileSync(process.env.PR_ADMISSION_FILE, 'utf8'));
+            const pull = JSON.parse(fs.readFileSync(process.env.REFRESHED_PULL, 'utf8'));
+            if (pull.head?.sha !== prior.pull?.head?.sha || oversizedPullRequestAdmission(pull).admitted) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `retry_kind=coordination\nretry_at=${new Date(Date.now() + 60000).toISOString()}\nexit_code=0\n`);
+              process.exit(0);
+            }
+            fs.writeFileSync(process.env.PR_ADMISSION_FILE, JSON.stringify({ ...prior, pull, observedAt: process.env.ADMISSION_OBSERVED_AT }));
+            fs.writeFileSync(`${process.env.REFRESHED_PULL}.ready`, '');
+          NODE
+            if [ ! -f "$refreshed_pull.ready" ]; then
+              rm -f "$refreshed_pull"
+              echo "::notice::Oversized admission changed after reservation; deferring for fresh admission."
+              exit 0
+            fi
+            rm -f "$refreshed_pull" "$refreshed_pull.ready"
+            pnpm run review -- --target-repo "${{ steps.target.outputs.target_repo }}" \
+              --artifact-dir artifacts/event --item-number "${{ steps.target.outputs.item_number }}" \
+              --output-retention debug \
+              --review-lease-owner "$REVIEW_LEASE_OWNER" \
+              --review-lease-comment-id "$REVIEW_LEASE_COMMENT_ID" \
+              --skip-start-comment "${admission_args[@]}"
+            start_heartbeat
+            cleanup_heartbeat
+            mark_finalizing
+            if [ -f "$superseded_marker" ]; then
+              echo "superseded=true" >> "$GITHUB_OUTPUT"
+              echo "exit_code=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::Oversized review generation lost queue authority; skipping publication."
+              exit 0
+            fi
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           codex_timeout_ms="${{ steps.target.outputs.codex_timeout_ms }}"
           if ! [[ "$codex_timeout_ms" =~ ^[0-9]+$ ]] || [ "$codex_timeout_ms" -lt 1 ]; then
             echo "Invalid Codex timeout: $codex_timeout_ms" >&2
@@ -1471,6 +1553,7 @@ jobs:
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --target-dir "${{ steps.target.outputs.target_checkout_dir }}" \
             --artifact-dir artifacts/event \
+            --output-retention debug \
             --batch-size 1 \
             --max-pages 1 \
             --codex-model internal \
@@ -1485,7 +1568,7 @@ jobs:
             --shard-index 0 \
             --shard-count 1 \
             --review-source-action "$SOURCE_ACTION" \
-            "${additional_prompt_arg[@]}" &
+            "${admission_args[@]}" "${additional_prompt_arg[@]}" &
           review_pid=$!
           review_pgid=$review_pid
           start_heartbeat
@@ -1593,6 +1676,7 @@ jobs:
           REVIEW_ACKNOWLEDGEMENT_COMMENT_ID: ${{ steps.automatic-review-status.outputs.status_comment_id }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           echo "authorized=false" >> "$GITHUB_OUTPUT"
           payload="$(node -e '
             const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
@@ -1610,7 +1694,7 @@ jobs:
           ')"
           response="$(mktemp)"
           trap 'rm -f "$response"' EXIT
-          status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --output "$response" --write-out '%{http_code}' --request POST \
             --header "content-type: application/json" --data-binary "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
@@ -1648,6 +1732,7 @@ jobs:
           EXACT_REVIEW_SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           echo "authorized=false" >> "$GITHUB_OUTPUT"
           payload="$(node -e '
             const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
@@ -1664,7 +1749,7 @@ jobs:
           ')"
           response="$(mktemp)"
           trap 'rm -f "$response"' EXIT
-          status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --output "$response" --write-out '%{http_code}' --request POST \
             --header "content-type: application/json" --data-binary "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
@@ -1799,6 +1884,7 @@ jobs:
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           test -s "$DIRECT_OUTCOME"
           jq -e '.kind == "eligible" and .disposition != null' "$DIRECT_OUTCOME" >/dev/null
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
@@ -1862,7 +1948,7 @@ jobs:
               }));
             ')"
             lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            lifecycle_response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
               --request POST \
               --header "content-type: application/json" \
               --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
@@ -1882,7 +1968,7 @@ jobs:
               }));
             ')"
             lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            lifecycle_response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
               --request POST \
               --header "content-type: application/json" \
               --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
@@ -1940,6 +2026,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           payload="$(node <<'NODE'
@@ -1981,26 +2068,21 @@ jobs:
           NODE
           )"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          for attempt in 1 2 3; do
-            response="$(
-              curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST \
-                --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/enqueue" || true
-            )"
-            if jq -e '.superseded == true' <<< "$response" >/dev/null 2>&1; then
-              echo "::notice::Exact-review publication revision $(jq -r '.publication_revision // "unknown"' <<< "$response") was superseded by revision $(jq -r '.superseded_by_revision // "unknown"' <<< "$response"); the newer publisher owns final delivery."
-              exit 0
-            fi
-            if jq -e '.ok == true and (.queued == true or .deduped == true)' <<< "$response" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
+          response="$(
+            control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $signature" \
+              --data "$payload" \
+              "$queue_url/internal/exact-review/enqueue" || true
+          )"
+          if jq -e '.superseded == true' <<< "$response" >/dev/null 2>&1; then
+            echo "::notice::Exact-review publication revision $(jq -r '.publication_revision // "unknown"' <<< "$response") was superseded by revision $(jq -r '.superseded_by_revision // "unknown"' <<< "$response"); the newer publisher owns final delivery."
+            exit 0
+          fi
+          if jq -e '.ok == true and (.queued == true or .deduped == true)' <<< "$response" >/dev/null; then
+            exit 0
+          fi
           exit 1
 
       - name: Expire queued exact review lease
@@ -2105,6 +2187,7 @@ jobs:
           REVIEW_ACKNOWLEDGEMENT_COMMENT_ID: ${{ steps.automatic-review-status.outputs.status_comment_id }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           echo "authorized=false" >> "$GITHUB_OUTPUT"
           payload="$(node -e '
             const leaseRevision = Number(process.env.EXACT_REVIEW_LEASE_REVISION);
@@ -2128,24 +2211,21 @@ jobs:
               phase: "status",
             }));
           ')"
-          for attempt in 1 2 3; do
-            status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
-              --output /dev/null \
-              --write-out '%{http_code}' \
-              --request POST \
-              --header "content-type: application/json" \
-              --data-binary "$payload" \
-              "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
-            if [ "$status" = "200" ]; then
-              echo "authorized=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$status" = "409" ]; then
-              echo "::notice::Skipping terminal review status because the queue lease was superseded."
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 5))"; fi
-          done
+          status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "content-type: application/json" \
+            --data-binary "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/heartbeat")" || status=""
+          if [ "$status" = "200" ]; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" = "409" ]; then
+            echo "::notice::Skipping terminal review status because the queue lease was superseded."
+            exit 0
+          fi
           echo "Unable to fence terminal review status against the active queue lease." >&2
           exit 1
 
@@ -2180,6 +2260,7 @@ jobs:
           EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           EXACT_REVIEW_SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
         run: |
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
             process.stdout.write(JSON.stringify({
@@ -2193,7 +2274,7 @@ jobs:
               phase: "finalizing",
             }));
           ')"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST --header "content-type: application/json" --data-binary "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/heartbeat" >/dev/null
 
@@ -2255,6 +2336,7 @@ jobs:
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && always() && (steps.direct-exact-review-publication.outputs.accepted != 'true' || steps.finalize-direct-exact-review-lifecycle.outcome == 'success') }}
         continue-on-error: true
         env:
+          SOURCE_CHECKOUT_OUTCOME: ${{ steps.source-checkout.outcome }}
           PRIMARY_OUTCOME: ${{ steps.exact-review-generation-result.outputs.outcome || 'failure' }}
           CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
@@ -2283,6 +2365,11 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          if [[ "$SOURCE_CHECKOUT_OUTCOME" == "success" ]]; then
+            source scripts/control-plane-curl.sh
+          else
+            source "$RUNNER_TEMP/control-plane-curl.sh"
+          fi
           test -n "$QUEUE_LEASE_ID"
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
@@ -2398,64 +2485,54 @@ jobs:
             }));
           ')"
           response_file="$(mktemp)"
-          error_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$error_file"' EXIT
-          for attempt in 1 2 3; do
-            while true; do
-              : > "$response_file"
-              : > "$error_file"
-              if status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
-                --output "$response_file" \
-                --write-out '%{http_code}' \
-                --request POST \
-                --header "content-type: application/json" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/complete" 2>"$error_file")"; then
-                response="$(<"$response_file")"
-                if [[ "$status" == 2* ]]; then
-                  exit 0
-                fi
-                if [ "$status" = "400" ] &&
-                  jq -e '.error == "invalid_review_failure_reason"' "$response_file" >/dev/null 2>&1 &&
-                  jq -e 'has("review_failure_reason")' <<< "$payload" >/dev/null; then
-                  # Status is valid only alongside a terminal reason; retain diagnostic detail.
-                  payload="$(jq -c 'del(.review_failure_reason, .review_failure_status)' <<< "$payload")"
-                  echo "::warning::Exact-review completion detected Worker/workflow deploy skew (invalid_review_failure_reason); retrying once without terminal reason/status, retaining review_failure detail."
-                  continue
-                fi
-                # Only this completion-specific conflict is emitted after the
-                # durable queue verifies that this exact v2 lease tuple was fenced
-                # by a newer source revision. Every generic ownership conflict
-                # stays visible so a malformed or mismatched callback cannot turn
-                # a failed completion into a green workflow.
-                if [ "$status" = "409" ]; then
-                  conflict_reason="$(RESPONSE="$response" node <<'NODE'
-                    const response = JSON.parse(process.env.RESPONSE || "{}");
-                    const safeConflicts = new Set(["lease_superseded"]);
-                    if (!safeConflicts.has(response.error)) process.exit(1);
-                    process.stdout.write(response.error);
-          NODE
-                  )" || {
-                    echo "Unexpected exact-review completion conflict: $response" >&2
-                    exit 1
-                  }
-                  echo "::notice::Exact-review completion skipped because its lease was superseded: $conflict_reason"
-                  exit 0
-                fi
-                echo "Exact-review completion returned HTTP $status: $response" >&2
-                if [[ "$status" != 5* ]]; then
-                  exit 1
-                fi
-              else
-                cat "$error_file" >&2
+          trap 'rm -f "$response_file"' EXIT
+          while true; do
+            : > "$response_file"
+            if status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "content-type: application/json" \
+              --data "$payload" \
+              "$queue_url/internal/exact-review/complete")"; then
+              response="$(<"$response_file")"
+              if [[ "$status" == 2* ]]; then
+                exit 0
               fi
-              break
-            done
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
+              if [ "$status" = "400" ] &&
+                jq -e '.error == "invalid_review_failure_reason"' "$response_file" >/dev/null 2>&1 &&
+                jq -e 'has("review_failure_reason")' <<< "$payload" >/dev/null; then
+                # Status is valid only alongside a terminal reason; retain diagnostic detail.
+                payload="$(jq -c 'del(.review_failure_reason, .review_failure_status)' <<< "$payload")"
+                echo "::warning::Exact-review completion detected Worker/workflow deploy skew (invalid_review_failure_reason); retrying once without terminal reason/status, retaining review_failure detail."
+                continue
+              fi
+              # Only this completion-specific conflict is emitted after the
+              # durable queue verifies that this exact v2 lease tuple was fenced
+              # by a newer source revision. Every generic ownership conflict
+              # stays visible so a malformed or mismatched callback cannot turn
+              # a failed completion into a green workflow.
+              if [ "$status" = "409" ]; then
+                conflict_reason="$(RESPONSE="$response" node <<'NODE'
+                  const response = JSON.parse(process.env.RESPONSE || "{}");
+                  const safeConflicts = new Set(["lease_superseded"]);
+                  if (!safeConflicts.has(response.error)) process.exit(1);
+                  process.stdout.write(response.error);
+          NODE
+                )" || {
+                  echo "Unexpected exact-review completion conflict: $response" >&2
+                  exit 1
+                }
+                echo "::notice::Exact-review completion skipped because its lease was superseded: $conflict_reason"
+                exit 0
+              fi
+              echo "Exact-review completion returned HTTP $status: $response" >&2
+              if [[ "$status" != 5* ]]; then
+                exit 1
+              fi
             fi
+            exit 1
           done
-          exit 1
 
       - name: Submit direct GitHub egress telemetry
         if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.direct-github-egress-observer.outcome == 'success' }}
@@ -2508,7 +2585,14 @@ jobs:
         env:
           CLASSIFICATION: >-
             ${{
-              (steps.review-complete-status-fence.outcome == 'failure' || steps.release-review-complete-status-fence.outcome == 'failure') && 'review_status_delivery_failure' ||
+              (
+                steps.reserve-exact-review-lease.outcome == 'failure' ||
+                steps.review-status-fence.outcome == 'failure' ||
+                steps.release-review-status-fence.outcome == 'failure' ||
+                steps.review-complete-status-fence.outcome == 'failure' ||
+                steps.release-review-complete-status-fence.outcome == 'failure' ||
+                steps.review-exact-event-item.outputs.control_plane_unavailable == 'true'
+              ) && 'queue_completion_failure' ||
               (
                 steps.exact-review-generation-result.outputs.outcome != 'success' &&
                 steps.exact-review-generation-result.outputs.retry_kind == '' &&
@@ -2536,6 +2620,14 @@ jobs:
       pull-requests: write
       statuses: read
     steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
       - name: Claim durable exact review publication
         id: publication-context
         env:
@@ -2546,6 +2638,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
@@ -2563,163 +2656,154 @@ jobs:
             }));
           ')"
           response_file="$(mktemp)"
-          error_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$error_file"' EXIT
-          for attempt in 1 2 3; do
-            : > "$response_file"
-            : > "$error_file"
-            if status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --request POST \
-              --header "content-type: application/json" \
-              --data "$payload" \
-              "$queue_url/internal/exact-review/claim" 2>"$error_file")"; then
-              response="$(<"$response_file")"
-              if [ "$status" = "409" ]; then
-                conflict_reason="$(RESPONSE="$response" node <<'NODE'
-                  const response = JSON.parse(process.env.RESPONSE || "{}");
-                  const safeConflicts = new Set([
-                    "lease_not_active",
-                    "lease_already_claimed",
-                    "lease_decision_unavailable",
-                    "stale_run_attempt",
-                  ]);
-                  if (!safeConflicts.has(response.error)) process.exit(1);
-                  process.stdout.write(response.error);
-          NODE
-                )" || {
-                  echo "Unexpected exact-review publication conflict: $response" >&2
-                  exit 1
-                }
-                echo "::notice::Skipping exact review publication because lease claim lost safely: $conflict_reason"
-                exit 0
-              fi
-              if [ "$status" != "200" ]; then
-                if [[ "$status" != 5* ]]; then
-                  echo "Exact-review publication claim returned HTTP $status: $response" >&2
-                  exit 1
-                fi
-              elif RESPONSE="$response" node <<'NODE'
-                const fs = require("node:fs");
+          trap 'rm -f "$response_file"' EXIT
+          : > "$response_file"
+          if status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/claim")"; then
+            response="$(<"$response_file")"
+            if [ "$status" = "409" ]; then
+              conflict_reason="$(RESPONSE="$response" node <<'NODE'
                 const response = JSON.parse(process.env.RESPONSE || "{}");
-                const decision = response.decision;
-                const publication = decision?.publication;
-                const producerDecision = publication?.producerDecision;
-                const leaseRevision = Number(response.lease_revision);
-                const claimGeneration = Number(response.claim_generation);
-                const repeatRevision = response.repeat_revision;
-                const publicationLeaseRevision = Number(publication?.leaseRevision);
-                const directItemKey = `${decision?.targetRepo}#${decision?.itemNumber}`;
-                const expectedDeferredItemKey = `${directItemKey}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
-                // Direct publication converts its already-leased base item into a
-                // recoverable publication. Its saved revision must still match
-                // this publisher lease before any external router handoff;
-                // deferred publication has its own key.
-                const directLifecycleRecovery =
-                  response.item_key === directItemKey &&
-                  publication?.itemKey === directItemKey &&
-                  Number.isInteger(publicationLeaseRevision) &&
-                  publicationLeaseRevision === leaseRevision;
-                const directLifecycle = directLifecycleRecovery ? publication?.directLifecycle : null;
-                const directLifecyclePlan = directLifecycle?.plan;
-                const directLifecycleReceiptOutcome = directLifecycle?.receiptOutcome;
-                const directLifecycleKinds = new Set([
-                  "router",
-                  "router_deferred_coverage",
-                  "router_not_required",
-                  "requeue",
-                  "target_missing",
-                  "target_closed",
-                  "guarded_open",
-                  "policy_noop",
+                const safeConflicts = new Set([
+                  "lease_not_active",
+                  "lease_already_claimed",
+                  "lease_decision_unavailable",
+                  "stale_run_attempt",
                 ]);
-                // Pre-projection rows have no saved post-effect intent. They
-                // deliberately retain artifact recovery rather than inferring a
-                // router or terminal result from a newer publisher run.
-                const directLifecycleRecoveryReady =
-                  directLifecycleRecovery &&
-                  directLifecyclePlan &&
-                  typeof directLifecyclePlan === "object" &&
-                  !Array.isArray(directLifecyclePlan) &&
-                  Object.keys(directLifecyclePlan).length === 1 &&
-                  directLifecycleKinds.has(directLifecyclePlan.kind) &&
-                  ["accepted", "deduped", "superseded"].includes(directLifecycleReceiptOutcome);
-                const deferredPublication = response.item_key === expectedDeferredItemKey;
-                if (
-                  response.claimed !== true ||
-                  response.protocol_version !== 2 ||
-                  typeof repeatRevision !== "boolean" ||
-                  response.item_key !== process.env.ITEM_KEY ||
-                  (!deferredPublication && !directLifecycleRecovery) ||
-                  decision?.sourceAction !== "exact_review_artifact_publish" ||
-                  !publication ||
-                  !producerDecision ||
-                  producerDecision.targetRepo !== decision.targetRepo ||
-                  producerDecision.targetBranch !== decision.targetBranch ||
-                  producerDecision.itemNumber !== decision.itemNumber ||
-                  producerDecision.itemKind !== decision.itemKind
-                ) process.exit(1);
-                if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
-                if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
-                const targetRepo = String(decision.targetRepo);
-                const [targetRepoOwner, targetRepoName] = targetRepo.split("/");
-                const targetSlug = targetRepo.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
-                const values = {
-                  artifact_name: publication.artifactName,
-                  generation_attempt: publication.producerRunAttempt,
-                  producer_run_id: publication.producerRunId,
-                  source_sha: publication.sourceSha,
-                  decision: JSON.stringify(producerDecision),
-                  item_key: publication.itemKey,
-                  protocol_version: publication.protocolVersion,
-                  lease_revision: publication.leaseRevision ?? "",
-                  claim_generation: publication.claimGeneration ?? "",
-                  target_repo: targetRepo,
-                  target_repo_owner: targetRepoOwner,
-                  target_repo_name: targetRepoName,
-                  target_slug: targetSlug,
-                  target_branch: decision.targetBranch,
-                  item_number: decision.itemNumber,
-                  item_kind: decision.itemKind,
-                  has_command_context: Boolean(
-                    producerDecision.commandStatusMarker || producerDecision.statusCommentId,
-                  ),
-                  live_proceeded: publication.liveProceeded,
-                  live_terminal_noop: publication.liveTerminalNoop,
-                  live_terminal_missing: publication.liveTerminalMissing,
-                  live_guarded_open: publication.liveGuardedOpen,
-                  publisher_lease_id: process.env.QUEUE_LEASE_ID,
-                  publisher_item_key: response.item_key,
-                  publisher_lease_revision: leaseRevision,
-                  publisher_claim_generation: claimGeneration,
-                  repeat_revision: repeatRevision,
-                  direct_lifecycle_recovery: directLifecycleRecoveryReady,
-                  direct_lifecycle_plan: directLifecycleRecoveryReady
-                    ? JSON.stringify(directLifecyclePlan)
-                    : "",
-                  direct_lifecycle_receipt_outcome: directLifecycleRecoveryReady
-                    ? directLifecycleReceiptOutcome
-                    : "",
-                };
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
-                for (const [key, value] of Object.entries(values)) {
-                  fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
-                }
+                if (!safeConflicts.has(response.error)) process.exit(1);
+                process.stdout.write(response.error);
           NODE
-              then
-                exit 0
-              else
-                echo "Exact-review publication claim returned an invalid success payload." >&2
+              )" || {
+                echo "Unexpected exact-review publication conflict: $response" >&2
+                exit 1
+              }
+              echo "::notice::Skipping exact review publication because lease claim lost safely: $conflict_reason"
+              exit 0
+            fi
+            if [ "$status" != "200" ]; then
+              if [[ "$status" != 5* ]]; then
+                echo "Exact-review publication claim returned HTTP $status: $response" >&2
                 exit 1
               fi
+            elif RESPONSE="$response" node <<'NODE'
+              const fs = require("node:fs");
+              const response = JSON.parse(process.env.RESPONSE || "{}");
+              const decision = response.decision;
+              const publication = decision?.publication;
+              const producerDecision = publication?.producerDecision;
+              const leaseRevision = Number(response.lease_revision);
+              const claimGeneration = Number(response.claim_generation);
+              const repeatRevision = response.repeat_revision;
+              const publicationLeaseRevision = Number(publication?.leaseRevision);
+              const directItemKey = `${decision?.targetRepo}#${decision?.itemNumber}`;
+              const expectedDeferredItemKey = `${directItemKey}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
+              // Direct publication converts its already-leased base item into a
+              // recoverable publication. Its saved revision must still match
+              // this publisher lease before any external router handoff;
+              // deferred publication has its own key.
+              const directLifecycleRecovery =
+                response.item_key === directItemKey &&
+                publication?.itemKey === directItemKey &&
+                Number.isInteger(publicationLeaseRevision) &&
+                publicationLeaseRevision === leaseRevision;
+              const directLifecycle = directLifecycleRecovery ? publication?.directLifecycle : null;
+              const directLifecyclePlan = directLifecycle?.plan;
+              const directLifecycleReceiptOutcome = directLifecycle?.receiptOutcome;
+              const directLifecycleKinds = new Set([
+                "router",
+                "router_deferred_coverage",
+                "router_not_required",
+                "requeue",
+                "target_missing",
+                "target_closed",
+                "guarded_open",
+                "policy_noop",
+              ]);
+              // Pre-projection rows have no saved post-effect intent. They
+              // deliberately retain artifact recovery rather than inferring a
+              // router or terminal result from a newer publisher run.
+              const directLifecycleRecoveryReady =
+                directLifecycleRecovery &&
+                directLifecyclePlan &&
+                typeof directLifecyclePlan === "object" &&
+                !Array.isArray(directLifecyclePlan) &&
+                Object.keys(directLifecyclePlan).length === 1 &&
+                directLifecycleKinds.has(directLifecyclePlan.kind) &&
+                ["accepted", "deduped", "superseded"].includes(directLifecycleReceiptOutcome);
+              const deferredPublication = response.item_key === expectedDeferredItemKey;
+              if (
+                response.claimed !== true ||
+                response.protocol_version !== 2 ||
+                typeof repeatRevision !== "boolean" ||
+                response.item_key !== process.env.ITEM_KEY ||
+                (!deferredPublication && !directLifecycleRecovery) ||
+                decision?.sourceAction !== "exact_review_artifact_publish" ||
+                !publication ||
+                !producerDecision ||
+                producerDecision.targetRepo !== decision.targetRepo ||
+                producerDecision.targetBranch !== decision.targetBranch ||
+                producerDecision.itemNumber !== decision.itemNumber ||
+                producerDecision.itemKind !== decision.itemKind
+              ) process.exit(1);
+              if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+              if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
+              const targetRepo = String(decision.targetRepo);
+              const [targetRepoOwner, targetRepoName] = targetRepo.split("/");
+              const targetSlug = targetRepo.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+              const values = {
+                artifact_name: publication.artifactName,
+                generation_attempt: publication.producerRunAttempt,
+                producer_run_id: publication.producerRunId,
+                source_sha: publication.sourceSha,
+                decision: JSON.stringify(producerDecision),
+                item_key: publication.itemKey,
+                protocol_version: publication.protocolVersion,
+                lease_revision: publication.leaseRevision ?? "",
+                claim_generation: publication.claimGeneration ?? "",
+                target_repo: targetRepo,
+                target_repo_owner: targetRepoOwner,
+                target_repo_name: targetRepoName,
+                target_slug: targetSlug,
+                target_branch: decision.targetBranch,
+                item_number: decision.itemNumber,
+                item_kind: decision.itemKind,
+                has_command_context: Boolean(
+                  producerDecision.commandStatusMarker || producerDecision.statusCommentId,
+                ),
+                live_proceeded: publication.liveProceeded,
+                live_terminal_noop: publication.liveTerminalNoop,
+                live_terminal_missing: publication.liveTerminalMissing,
+                live_guarded_open: publication.liveGuardedOpen,
+                publisher_lease_id: process.env.QUEUE_LEASE_ID,
+                publisher_item_key: response.item_key,
+                publisher_lease_revision: leaseRevision,
+                publisher_claim_generation: claimGeneration,
+                repeat_revision: repeatRevision,
+                direct_lifecycle_recovery: directLifecycleRecoveryReady,
+                direct_lifecycle_plan: directLifecycleRecoveryReady
+                  ? JSON.stringify(directLifecyclePlan)
+                  : "",
+                direct_lifecycle_receipt_outcome: directLifecycleRecoveryReady
+                  ? directLifecycleReceiptOutcome
+                  : "",
+              };
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
+              for (const [key, value] of Object.entries(values)) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+              }
+          NODE
+            then
+              exit 0
             else
-              cat "$error_file" >&2
+              echo "Exact-review publication claim returned an invalid success payload." >&2
+              exit 1
             fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
+          fi
           exit 1
 
       - name: Replay committed direct lifecycle handoff
@@ -2744,6 +2828,7 @@ jobs:
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           lifecycle_kind="$(DIRECT_LIFECYCLE_PLAN="$DIRECT_LIFECYCLE_PLAN" node -e '
@@ -2780,7 +2865,7 @@ jobs:
               }));
             ')"
             lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            lifecycle_response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
               --request POST \
               --header "content-type: application/json" \
               --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
@@ -2801,7 +2886,7 @@ jobs:
               }));
             ')"
             lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            lifecycle_response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
               --request POST \
               --header "content-type: application/json" \
               --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
@@ -2861,6 +2946,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
+        id: source-checkout
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         with:
           # The artifact validator binds the producer SHA. The publisher itself
@@ -3197,6 +3283,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const revision = Number(process.env.REVISION);
             if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
@@ -3210,7 +3297,7 @@ jobs:
           ')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -3234,6 +3321,7 @@ jobs:
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
+          source scripts/control-plane-curl.sh
           gh workflow run repair-comment-router.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
@@ -3256,7 +3344,7 @@ jobs:
           ')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -3275,6 +3363,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const revision = Number(process.env.REVISION);
             if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
@@ -3288,7 +3377,7 @@ jobs:
           ')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write("sha256="+crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex"))')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -3307,6 +3396,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const revision = Number(process.env.REVISION);
             if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
@@ -3320,7 +3410,7 @@ jobs:
           ')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -3352,6 +3442,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           payload="$(node <<'NODE'
@@ -3370,7 +3461,7 @@ jobs:
           NODE
           )"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST \
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
@@ -3619,6 +3710,7 @@ jobs:
         if: ${{ steps.publication-context.outputs.claimed == 'true' && always() }}
         continue-on-error: true
         env:
+          SOURCE_CHECKOUT_OUTCOME: ${{ steps.source-checkout.outcome }}
           CLAIM_GENERATION: ${{ steps.publication-context.outputs.publisher_claim_generation }}
           ITEM_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           LEASE_REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
@@ -3644,6 +3736,11 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          if [[ "$SOURCE_CHECKOUT_OUTCOME" == "success" ]]; then
+            source scripts/control-plane-curl.sh
+          else
+            source "$RUNNER_TEMP/control-plane-curl.sh"
+          fi
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
             const leaseRevision = Number(process.env.LEASE_REVISION);
@@ -3715,18 +3812,13 @@ jobs:
               ...(stateWriter ? { state_writer: stateWriter } : {}),
             }));
           ')"
-          for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --data "$payload" \
-              "$queue_url/internal/exact-review/complete" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
+          if control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/complete" >/dev/null; then
+            exit 0
+          fi
           exit 1
 
       - name: Mark active lease retry waiting
@@ -3770,6 +3862,14 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
       - name: Claim committed terminal finalization
         id: finalization-context
         env:
@@ -3780,6 +3880,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           printf 'claimed=false\n' >> "$GITHUB_OUTPUT"
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
@@ -3797,50 +3898,40 @@ jobs:
             }));
           ')"
           response_file="$(mktemp)"
-          error_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$error_file"' EXIT
-          for attempt in 1 2 3; do
-            : > "$response_file"
-            : > "$error_file"
-            if status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
-              --output "$response_file" --write-out '%{http_code}' \
-              --request POST --header "content-type: application/json" --data "$payload" \
-              "$queue_url/internal/exact-review/claim" 2>"$error_file")"; then
-              response="$(<"$response_file")"
-              if [ "$status" = "409" ]; then
-                conflict_reason="$(RESPONSE="$response" node <<'NODE'
-                  const response = JSON.parse(process.env.RESPONSE || "{}");
-                  const safeConflicts = new Set([
-                    "lease_not_active",
-                    "lease_already_claimed",
-                    "lease_decision_unavailable",
-                    "stale_run_attempt",
-                  ]);
-                  if (!safeConflicts.has(response.error)) process.exit(1);
-                  process.stdout.write(response.error);
+          trap 'rm -f "$response_file"' EXIT
+          : > "$response_file"
+          if status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output "$response_file" --write-out '%{http_code}' \
+            --request POST --header "content-type: application/json" --data "$payload" \
+            "$queue_url/internal/exact-review/claim")"; then
+            response="$(<"$response_file")"
+            if [ "$status" = "409" ]; then
+              conflict_reason="$(RESPONSE="$response" node <<'NODE'
+                const response = JSON.parse(process.env.RESPONSE || "{}");
+                const safeConflicts = new Set([
+                  "lease_not_active",
+                  "lease_already_claimed",
+                  "lease_decision_unavailable",
+                  "stale_run_attempt",
+                ]);
+                if (!safeConflicts.has(response.error)) process.exit(1);
+                process.stdout.write(response.error);
           NODE
-                )" || {
-                  echo "Unexpected terminal-finalization claim conflict: $response" >&2
-                  exit 1
-                }
-                echo "::notice::Skipping terminal finalization because lease claim lost safely: $conflict_reason"
-                exit 0
-              fi
-              if [ "$status" = "200" ]; then
-                break
-              fi
-              if [[ "$status" != 5* ]]; then
-                echo "Terminal-finalization claim returned HTTP $status: $response" >&2
+              )" || {
+                echo "Unexpected terminal-finalization claim conflict: $response" >&2
                 exit 1
-              fi
+              }
+              echo "::notice::Skipping terminal finalization because lease claim lost safely: $conflict_reason"
+              exit 0
             fi
-            if [ "$attempt" = "3" ]; then
-              cat "$error_file" >&2
-              echo "Terminal-finalization claim failed after retries" >&2
+            if [ "$status" != "200" ]; then
+              echo "Terminal-finalization claim returned HTTP $status: $response" >&2
               exit 1
             fi
-            sleep "$attempt"
-          done
+          else
+            echo "Terminal-finalization claim failed after retries" >&2
+            exit 1
+          fi
           RESPONSE="$response" node <<'NODE'
           const fs = require("node:fs");
           const response = JSON.parse(process.env.RESPONSE || "{}");
@@ -3886,6 +3977,7 @@ jobs:
           NODE
 
       - uses: actions/checkout@v7
+        id: source-checkout
         if: ${{ steps.finalization-context.outputs.claimed == 'true' }}
         with:
           # Fetch blobs during the retryable fetch instead of lazily fetching
@@ -3911,6 +4003,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const leaseRevision = Number(process.env.LEASE_REVISION);
             const claimGeneration = Number(process.env.CLAIM_GENERATION);
@@ -3930,7 +4023,7 @@ jobs:
           ')"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          response_status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          response_status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --output "$response_file" --write-out '%{http_code}' \
             --request POST --header "content-type: application/json" --data "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/attempt")"
@@ -3990,6 +4083,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           update_log="$(mktemp)"
           trap 'rm -f "$update_log"' EXIT
           pnpm run repair:update-command-status -- \
@@ -4016,7 +4110,7 @@ jobs:
                 }));
               ')"
               signature="$(PAYLOAD="$failure_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-              curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
                 --request POST --header "content-type: application/json" \
                 --header "x-clawsweeper-exact-review-signature: $signature" \
                 --data "$failure_payload" \
@@ -4042,6 +4136,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           payload="$(node -e '
             const fenceKey = process.env.FENCE_KEY || "";
             const revision = Number(process.env.REVISION);
@@ -4073,7 +4168,7 @@ jobs:
             }));
           ')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
             --data "$payload" \
@@ -4096,6 +4191,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          source scripts/control-plane-curl.sh
           skip_reason="locked_conversation"
           expected_state="skipped_locked"
           if [ "$MISSING_STATUS_COMMENT" = "true" ]; then
@@ -4121,7 +4217,7 @@ jobs:
               ...(statusCommentId === null ? {} : { status_comment_id: statusCommentId }),
             }));
           ')"
-          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+          response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
             --request POST --header "content-type: application/json" --data "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/skip")"
           jq -e --arg state "$expected_state" \
@@ -4130,6 +4226,7 @@ jobs:
       - name: Requeue unobserved terminal acknowledgement
         if: ${{ always() && steps.finalization-context.outputs.claimed == 'true' && steps.observe-verified-terminal-acknowledgement.outcome != 'success' && !((steps.update-final-command-status.outputs.locked_conversation == 'true' || steps.update-final-command-status.outputs.missing_status_comment == 'true') && steps.complete-locked-terminal-acknowledgement.outcome == 'success') }}
         env:
+          SOURCE_CHECKOUT_OUTCOME: ${{ steps.source-checkout.outcome }}
           ITEM_KEY: ${{ steps.finalization-context.outputs.item_key }}
           QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
           LEASE_REVISION: ${{ steps.finalization-context.outputs.lease_revision }}
@@ -4138,6 +4235,11 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          if [[ "$SOURCE_CHECKOUT_OUTCOME" == "success" ]]; then
+            source scripts/control-plane-curl.sh
+          else
+            source "$RUNNER_TEMP/control-plane-curl.sh"
+          fi
           payload="$(node -e '
             const leaseRevision = Number(process.env.LEASE_REVISION);
             const claimGeneration = Number(process.env.CLAIM_GENERATION);
@@ -4151,7 +4253,7 @@ jobs:
           ')"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          response_status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+          response_status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
             --write-out '%{http_code}' --output "$response_file" \
             --request POST --header "content-type: application/json" --data "$payload" \
             "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/retry")"
@@ -4986,7 +5088,6 @@ jobs:
         with:
           target-repo: ${{ needs.plan.outputs.target_repo }}
           target-dir: ${{ needs.plan.outputs.target_checkout_dir }}
-          review-artifact-dir: ${{ github.workspace }}/review-artifacts/shard-${{ matrix.shard }}
 
       - name: Mark shard start
         id: shard-start
@@ -5039,6 +5140,7 @@ jobs:
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --target-dir "../${{ needs.plan.outputs.target_checkout_dir }}" \
             --artifact-dir ../review-artifacts/shard-${{ matrix.shard }} \
+            --output-retention debug \
             --batch-size ${{ needs.plan.outputs.batch_size }} \
             --max-pages ${{ needs.plan.outputs.max_pages }} \
             --codex-model internal \
@@ -5851,6 +5953,14 @@ jobs:
       actions: read
       contents: read
     steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -5886,6 +5996,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           recovery_marker="[clawsweeper-recovery-attempt=1]"
@@ -5971,34 +6082,28 @@ jobs:
                 }
               }')"
             queued=false
-            for attempt in 1 2 3; do
-              # shellcheck disable=SC2016 # The Node source must retain its literal template expression.
-              signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-              response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST \
-                --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/enqueue")" || response=""
-              if jq -e '.ok == true and (.queued == true or .deduped == true or .shed == true or .accepted == false)' <<<"$response" >/dev/null; then
-                if jq -e '.accepted == false' <<<"$response" >/dev/null; then
-                  echo "Item #$item_number: Recovery skipped because the target is disabled." | tee -a "$GITHUB_STEP_SUMMARY"
-                elif jq -e '.shed == true' <<<"$response" >/dev/null; then
-                  echo "Item #$item_number: Recovery shed by exact-review queue backpressure." | tee -a "$GITHUB_STEP_SUMMARY"
-                elif jq -e '.deduped == true' <<<"$response" >/dev/null; then
-                  echo "Item #$item_number: recovery admission deduplicated." | tee -a "$GITHUB_STEP_SUMMARY"
-                else
-                  echo "Item #$item_number: recovery admission queued." | tee -a "$GITHUB_STEP_SUMMARY"
-                fi
-                queued=true
-                break
+            # shellcheck disable=SC2016 # The Node source must retain its literal template expression.
+            signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+            response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $signature" \
+              --data "$payload" \
+              "$queue_url/internal/exact-review/enqueue")" || response=""
+            if jq -e '.ok == true and (.queued == true or .deduped == true or .shed == true or .accepted == false)' <<<"$response" >/dev/null; then
+              if jq -e '.accepted == false' <<<"$response" >/dev/null; then
+                echo "Item #$item_number: Recovery skipped because the target is disabled." | tee -a "$GITHUB_STEP_SUMMARY"
+              elif jq -e '.shed == true' <<<"$response" >/dev/null; then
+                echo "Item #$item_number: Recovery shed by exact-review queue backpressure." | tee -a "$GITHUB_STEP_SUMMARY"
+              elif jq -e '.deduped == true' <<<"$response" >/dev/null; then
+                echo "Item #$item_number: recovery admission deduplicated." | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "Item #$item_number: recovery admission queued." | tee -a "$GITHUB_STEP_SUMMARY"
               fi
-              echo "Recovery queue acknowledgement was not accepted on attempt $attempt." >&2
-              if [ "$attempt" -lt 3 ]; then
-                sleep "$((attempt * 5))"
-              fi
-            done
+              queued=true
+            fi
             if [ "$queued" != "true" ]; then
+              echo "Recovery queue acknowledgement was not accepted after control-plane retries." >&2
               failed_recovery_dispatches+=("$item_number")
             fi
           done

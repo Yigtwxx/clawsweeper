@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +13,7 @@ import { createInterface } from "node:readline";
 import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
+  CODEX_THREAD_STATE_MAX_BYTES,
   codexOutputTail,
   openCodexOutputCapture,
 } from "./codex-output-capture.js";
@@ -42,6 +44,7 @@ interface WorkerOptions {
   stderrPath: string;
   tailBytes: number;
   maxOutputFileBytes: number;
+  outputLastMessageBytes?: number;
   appServer: AppServerOptions;
 }
 
@@ -373,9 +376,29 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   if (turnId && turn?.id !== turnId) return;
   turnStatus = typeof turn?.status === "string" ? turn.status : "";
   const failed = turnStatus !== "completed";
+  // Codex clears partial messages on failed/interrupted turns. Only confirmed
+  // completion can publish a result, even if an earlier item looked complete.
+  if (failed) finalMessage = "";
   if (execOptions.outputLastMessagePath && finalMessage) {
+    if (
+      options.outputLastMessageBytes !== undefined &&
+      Buffer.byteLength(finalMessage) > options.outputLastMessageBytes
+    ) {
+      await finish(
+        1,
+        null,
+        new Error(`Codex result exceeded its ${options.outputLastMessageBytes}-byte limit.`),
+      );
+      return;
+    }
     mkdirSync(dirname(execOptions.outputLastMessagePath), { recursive: true });
-    writeFileSync(execOptions.outputLastMessagePath, finalMessage, "utf8");
+    writeFileSync(
+      execOptions.outputLastMessagePath,
+      finalMessage,
+      options.outputLastMessageBytes === undefined
+        ? "utf8"
+        : { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
   }
   terminalWrite(
     `\r\n\r\n[ClawSweeper] Codex turn ${turnStatus || "finished"}. Deterministic repair gates continue in GitHub Actions.\r\n`,
@@ -639,13 +662,21 @@ function readThreadState(path: string): ThreadState | null {
 }
 
 function writeThreadState(path: string, state: ThreadState): void {
+  const content = `${JSON.stringify(state, null, 2)}\n`;
+  if (Buffer.byteLength(content) > CODEX_THREAD_STATE_MAX_BYTES) {
+    throw new Error(`Codex thread state exceeded its ${CODEX_THREAD_STATE_MAX_BYTES}-byte limit.`);
+  }
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.tmp-${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, content, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 function parseRpcMessage(line: string): RpcMessage | null {

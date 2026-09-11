@@ -469,11 +469,34 @@ test("OpenClaw runner writes the normalized last message and notes ignored steer
       },
       timeoutMs: 10_000,
       codexExtraArgs: ["--output-last-message", outputPath, "--json", "-"],
+      outputLastMessageBytes: 4,
       appServer: { statePath: join(root, "thread.json") },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(readFileSync(outputPath, "utf8"), "done");
     assert.equal(result.stderr.match(/CLAWSWEEPER_STEERABLE_CODEX is Codex-specific/g)?.length, 1);
+
+    const oversizedPath = join(root, "oversized-last-message.txt");
+    const oversized = runAgentProcess({
+      label: "bounded-openclaw",
+      scanSource: { kind: "prompt" },
+      prompt: "prompt",
+      model: "internal",
+      reasoningEffort: "medium",
+      cwd: root,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_RUNNER: "openclaw",
+        CLAWSWEEPER_OPENCLAW_MODEL: "openai/test",
+        CLAWSWEEPER_OPENCLAW_BIN: binary,
+        OPENCLAW_TEST_RECORD: join(root, "bounded.json"),
+      },
+      timeoutMs: 10_000,
+      codexExtraArgs: ["--output-last-message", oversizedPath, "--json", "-"],
+      outputLastMessageBytes: 3,
+    });
+    assert.match(oversized.error?.message ?? "", /exceeded its 3-byte limit/);
+    assert.equal(existsSync(oversizedPath), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -697,9 +720,10 @@ process.on("SIGTERM", () => {});
 const announce = () => {
   if (!fs.existsSync(readyPath)) return setTimeout(announce, 10);
   fs.writeFileSync(
-    process.env.OPENCLAW_TEST_PID_PATH,
+    process.env.OPENCLAW_TEST_PID_PATH + ".tmp",
     JSON.stringify({ child: process.pid, grandchild: grandchild.pid }),
   );
+  fs.renameSync(process.env.OPENCLAW_TEST_PID_PATH + ".tmp", process.env.OPENCLAW_TEST_PID_PATH);
 };
 announce();
 setInterval(() => {}, 1000);
@@ -787,9 +811,10 @@ const grandchild = spawn(
 const announce = () => {
   if (!fs.existsSync(readyPath)) return setTimeout(announce, 10);
   fs.writeFileSync(
-    process.env.OPENCLAW_TEST_PID_PATH,
+    process.env.OPENCLAW_TEST_PID_PATH + ".tmp",
     JSON.stringify({ child: process.pid, grandchild: grandchild.pid }),
   );
+  fs.renameSync(process.env.OPENCLAW_TEST_PID_PATH + ".tmp", process.env.OPENCLAW_TEST_PID_PATH);
 };
 announce();
 setInterval(() => {}, 1000);

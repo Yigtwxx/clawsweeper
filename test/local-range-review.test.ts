@@ -10,6 +10,7 @@ import {
   renameSync,
   readFileSync,
   realpathSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -671,7 +672,7 @@ test("review rejects --item-number combined with --local-range", () => {
   }
 });
 
-test("--local-range defaults to the current checkout and isolates gh config in artifacts", (t) => {
+test("--local-range failure emits one JSON result and removes default scratch", (t) => {
   useFakeScanner(t);
   const dir = initRepo();
   const codexDir = mkdtempSync(join(tmpdir(), "lrr-default-codex-"));
@@ -701,6 +702,8 @@ test("--local-range defaults to the current checkout and isolates gh config in a
         "base-ref",
         "--target-repo",
         "openclaw/clawsweeper",
+        "--result-format",
+        "json",
       ],
       {
         cwd: dir,
@@ -719,21 +722,65 @@ test("--local-range defaults to the current checkout and isolates gh config in a
     const [codexCwd, ghConfigDir] = readFileSync(fakeCodexMarker, "utf8").trim().split("\n");
     assert.equal(realpathSync(codexCwd ?? ""), realpathSync(dir));
     assert.equal(basename(ghConfigDir ?? ""), ".gh-empty");
-    assert.match(basename(dirname(ghConfigDir ?? "")), /^local-range-\d+-\d+$/);
-    const gitArtifactRoot = resolve(
-      dir,
-      git(dir, "rev-parse", "--git-path", "clawsweeper/reviews"),
-    );
-    assert.equal(realpathSync(dirname(dirname(ghConfigDir ?? ""))), realpathSync(gitArtifactRoot));
-    assert.ok(existsSync(ghConfigDir ?? ""));
-    const cacheMetrics = JSON.parse(
-      readFileSync(join(dirname(ghConfigDir ?? ""), "review-cache-metrics.json"), "utf8"),
-    ) as Record<string, unknown>;
-    assert.equal(cacheMetrics.structural_cache_hits, 0);
-    assert.equal(cacheMetrics.content_cache_hits, 0);
+    assert.match(basename(dirname(ghConfigDir ?? "")), /^clawsweeper-review-/);
+    assert.equal(existsSync(dirname(ghConfigDir ?? "")), false);
+    const outputLines = result.stdout.trim().split("\n");
+    assert.equal(outputLines.length, 1, result.stdout);
+    const output = JSON.parse(outputLines[0]!) as Record<string, unknown>;
+    assert.equal(output.status, "failed");
+    assert.equal(output.retention, "none");
+    assert.equal(Array.isArray(output.reports), true);
     assert.equal(git(dir, "status", "--porcelain"), "");
   } finally {
     rmSync(codexDir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--local-range proof-binding refusal removes all run-owned scratch", () => {
+  const dir = initRepo();
+  const scratch = mkdtempSync(join(tmpdir(), "lrr-proof-binding-scratch-"));
+  try {
+    writeFileSync(join(dir, "a.txt"), "base\n");
+    git(dir, "add", "a.txt");
+    git(dir, "commit", "-q", "-m", "init");
+    git(dir, "branch", "base-ref");
+    writeFileSync(join(dir, "a.txt"), "base\nfeature\n");
+    git(dir, "add", "a.txt");
+    git(dir, "commit", "-q", "-m", "feat: local range");
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "review",
+        "--local-range",
+        "--base",
+        "base-ref",
+        "--target-repo",
+        "openclaw/clawsweeper",
+        "--review-source-action",
+        "command_proof_result",
+        "--result-format",
+        "json",
+      ],
+      {
+        cwd: dir,
+        encoding: "utf8",
+        env: { ...process.env, TMPDIR: scratch },
+        timeout: 30_000,
+      },
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stdout,
+      /commanded proof reassessment is missing its exact-subject binding/,
+    );
+    assert.deepEqual(readdirSync(scratch), []);
+    assert.equal(git(dir, "status", "--porcelain"), "");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -834,7 +881,6 @@ if (args[0] === "sandbox") {
   process.stderr.write(result.stderr ?? "");
   process.exit(result.status ?? 1);
 }
-const outputPath = args[args.indexOf("--output-last-message") + 1];
 const prompt = fs.readFileSync(0, "utf8");
 const captures = fs.existsSync(process.env.LOCAL_REVIEW_CAPTURE)
   ? JSON.parse(fs.readFileSync(process.env.LOCAL_REVIEW_CAPTURE, "utf8"))
@@ -849,8 +895,7 @@ if (process.env.LOCAL_REVIEW_FAIL === "1") {
   process.stderr.write("deterministic local review failure\\n");
   process.exit(1);
 }
-fs.writeFileSync(outputPath, fs.readFileSync(process.env.LOCAL_REVIEW_DECISION));
-process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1 } }) + "\\n");
+process.stdout.write(fs.readFileSync(process.env.LOCAL_REVIEW_DECISION, "utf8") + "\\n");
 `,
   );
   if (process.platform === "win32") {
