@@ -942,6 +942,9 @@ export class ExactReviewQueue {
   private alarmSampleCount = 0;
   private alarmSampleLoggedAt = -1;
   private scheduledAlarmDecision: AlarmScheduleDecision | null = null;
+  private alarmInFlightAt: number | null = null;
+  private alarmTask: Promise<void> | null = null;
+  private overdueAlarmRecoveryAttempted = false;
   private recentDurablePublicationEventsCache = new Map<
     string,
     { expiresAt: number; value: NonNullable<ReturnType<typeof recentDurablePublicationEvents>> }
@@ -5087,13 +5090,19 @@ export class ExactReviewQueue {
     }
   }
 
-  async alarm() {
+  alarm(): Promise<void> {
+    // Native delivery can race a request-driven recovery. Both must join the
+    // same operation, including its failure, rather than dispatching twice.
+    if (this.alarmTask) return this.alarmTask;
+    this.overdueAlarmRecoveryAttempted = false;
+    this.alarmInFlightAt = Date.now();
     this.invalidateReadCaches();
-    try {
-      await this.handleAlarm();
-    } finally {
+    this.alarmTask = this.handleAlarm().finally(() => {
+      this.alarmTask = null;
+      this.alarmInFlightAt = null;
       this.invalidateReadCaches();
-    }
+    });
+    return this.alarmTask;
   }
 
   private async handleAlarm() {
@@ -14062,7 +14071,12 @@ export class ExactReviewQueue {
   ) {
     const scheduled = await this.storage.getAlarm();
     const now = Date.now();
-    if (scheduled === null || scheduled <= now || next < scheduled) {
+    // Retained auxiliary work can be overdue. Use a fresh deadline so repeated
+    // requests do not keep replacing a pending alarm with an expired timestamp.
+    // A due stored alarm is still pending delivery. Do not postpone it; the
+    // alarm handler clears it before arranging the next wake.
+    next = Math.max(now + 1_000, next);
+    if (scheduled === null || next < scheduled) {
       await this.storage.setAlarm(next);
       const backoff = (this.bayTelemetryNoProgressDeadline ?? 0) > now;
       this.scheduledAlarmDecision = [reason, next, now, null, backoff];
@@ -14181,26 +14195,63 @@ export class ExactReviewQueue {
       this.scheduledAlarmDecision = null;
       return;
     }
-    const next = selected[1]!;
+    // Auxiliary wake sources do not share the queue read model's deadline floor.
+    // Normalize after the asynchronous reads, including recovery after a long gap.
     const scheduled = await this.storage.getAlarm();
+    const schedulingNow = Date.now();
+    const next = Math.max(schedulingNow + 1_000, selected[1]!);
     if (
       preserveQueueWake &&
-      (scheduled === null || scheduled <= now || scheduled > preservedWakeAt)
+      (scheduled === null || scheduled <= schedulingNow || scheduled > preservedWakeAt)
     ) {
       // An alarm was consumed/replaced while we awaited another authority.
       // Re-read durable state instead of reusing the earlier request snapshot.
       await this.scheduleNextFromState(this.readSchedulingStateSync(), Date.now(), true);
       return;
     }
-    if (scheduled === null || scheduled <= now || next < scheduled) {
+    // A delivery can remain stranded after repeated historical replacements.
+    // Retry it once per object generation, only well beyond normal delivery and
+    // retry delays and while no handler is running. Ordinary due alarms remain
+    // untouched. Fence before awaiting storage so concurrent requests cannot
+    // turn this recovery into another sliding deadline.
+    const recoverStrandedAlarm =
+      scheduled !== null &&
+      scheduled < schedulingNow - 5 * 60_000 &&
+      this.alarmInFlightAt === null &&
+      !this.overdueAlarmRecoveryAttempted;
+    if (scheduled === null || next < scheduled || recoverStrandedAlarm) {
+      if (recoverStrandedAlarm) this.overdueAlarmRecoveryAttempted = true;
       await this.storage.setAlarm(next);
+      if (recoverStrandedAlarm) {
+        console.warn("exact_review_queue_stranded_alarm_rearmed", {
+          observed_at: schedulingNow,
+          previous_alarm_at: scheduled,
+          new_alarm_at: next,
+        });
+      }
       this.scheduledAlarmDecision = [
         selected[0],
         next,
-        now,
+        schedulingNow,
         bayTelemetryRecoveryPending,
         (this.bayTelemetryNoProgressDeadline ?? 0) > now,
       ];
+      if (recoverStrandedAlarm && typeof this.state.waitUntil === "function") {
+        // Alarm delivery may itself be unavailable. Use the same processor and
+        // its admission checks, without holding the incoming request open.
+        // waitUntil expresses background ownership, not a retry guarantee.
+        this.state.waitUntil(
+          this.alarm().catch(async () => {
+            console.error("exact_review_queue_recovery_processor_failed");
+            const pending = await this.storage.getAlarm();
+            const failedAt = Date.now();
+            const retryAt = failedAt + 60_000;
+            if (pending === null || pending <= failedAt || retryAt < pending) {
+              await this.storage.setAlarm(retryAt);
+            }
+          }),
+        );
+      }
     }
   }
 }
