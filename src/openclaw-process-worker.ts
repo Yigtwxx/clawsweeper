@@ -86,7 +86,7 @@ child.once("close", (status, signal) => {
 // worker never reaches it. Forward the stop to the whole tree, as the Codex worker
 // does, instead of leaving the CLI running after the worker is gone.
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.once(signal, () => {
+  process.on(signal, () => {
     if (terminating) return;
     terminating = true;
     forceKillTimer = terminateProcessTree(child, signal);

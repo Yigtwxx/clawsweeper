@@ -3,7 +3,7 @@
 // Both arms start the real compiled OpenClaw process worker with a fake `openclaw`
 // binary that spawns a grandchild and never exits on its own, then send SIGTERM to the
 // worker itself, the signal a job cancellation or an outer deadline delivers, and record
-// whether the child and grandchild are still alive three seconds later. Two scenarios run
+// whether the child and grandchild are still alive three seconds later. Three scenarios run
 // per arm: the direct child ignores SIGTERM, and the direct child exits on SIGTERM while
 // its grandchild ignores it. The baseline arm compiles src/openclaw-process-worker.ts from
 // the base commit (default: merge base with origin/main, or HEAD~1 once the change is on
@@ -152,6 +152,11 @@ const scenarios = [
     name: "direct child exits on SIGTERM, grandchild ignores it",
     script: fakeOpenclaw(false),
   },
+  {
+    name: "direct child ignores repeated SIGTERM (grandchild ignores too)",
+    script: fakeOpenclaw(true),
+    repeated: true,
+  },
 ];
 
 function processAlive(pid) {
@@ -212,6 +217,10 @@ async function runScenario(arm, scenario) {
     pids = JSON.parse(readFileSync(pidPath, "utf8"));
     const signalledAt = Date.now();
     worker.kill("SIGTERM");
+    if (scenario.repeated) {
+      await sleep(50);
+      worker.kill("SIGTERM");
+    }
     const exit = await workerExit;
     const workerExitMs = Date.now() - signalledAt;
     const reapDeadline = signalledAt + 3_000;
@@ -278,7 +287,8 @@ const candidateStops = (entry, expectedSignal) =>
 const pass =
   baselineResult.scenarios.every(baselineLeaks) &&
   candidateStops(candidateResult.scenarios[0], "SIGKILL") &&
-  candidateStops(candidateResult.scenarios[1], "SIGTERM");
+  candidateStops(candidateResult.scenarios[1], "SIGTERM") &&
+  candidateStops(candidateResult.scenarios[2], "SIGKILL");
 const summary = {
   head,
   base: baseline.baseSha,
