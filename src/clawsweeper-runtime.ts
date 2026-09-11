@@ -1237,6 +1237,7 @@ const {
 } = commandOperations;
 
 const { reviewCommand } = createReviewCommandWorkflow({
+  ghJson,
   ...reviewActionLedger,
   get activeReviewMutationRunner() {
     return githubExecution.activeReviewMutationRunner;
@@ -1508,6 +1509,13 @@ function liveProofReviewCommand(args: Args): void {
   };
   const dependencies = {
     frontMatterValue: recordMetadata.frontMatterValue,
+    materializePullRequestReviewTree: (
+      options: Parameters<typeof contextHydration.materializePullRequestReviewTree>[0],
+    ) =>
+      // The synchronous metadata resolver reads the active target; restore it before execution.
+      withTargetProfile(repositoryProfileFor(repo), () =>
+        contextHydration.materializePullRequestReviewTree(options),
+      ),
     reportLiveProofPlan: reportParser.reportLiveProofPlan,
     repositoryProfileFor,
   };

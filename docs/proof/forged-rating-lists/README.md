@@ -13,15 +13,15 @@ report writer, report re-parser, and public comment renderer on one synthetic
 pull-request decision whose rating summary quotes a `Next rank-up steps:` block
 with a forged step and whose vision reason quotes a `Vision evidence:` block
 with forged evidence. The baseline arm compiles `src/clawsweeper-report-helpers.ts`
-from the base commit into a separate `dist`; the candidate arm uses the current
-build. No model inference, GitHub call, or credential is involved.
+from the base commit in an isolated source copy; the candidate arm uses the current
+build. The tracked checkout is never rewritten, including on interruption. No model inference, GitHub call, or credential is involved.
 
 ```sh
 pnpm run build
 node docs/proof/forged-rating-lists/run-proof.mjs --out .artifacts/forged-rating-lists
 ```
 
-`--base <rev>` selects the baseline commit (default `HEAD~1`); `--baseline-dist`
+`--base <rev>` selects the baseline commit (default `origin/main`; use the pre-fix revision after landing); `--baseline-dist`
 reuses a previously compiled baseline. The driver writes both durable reports,
 both rendered comments, and `summary.json` to the output directory and exits
 non-zero unless the baseline publishes the forged items and the candidate

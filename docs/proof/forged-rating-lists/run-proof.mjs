@@ -4,12 +4,12 @@
 // re-parser, and public comment renderer on one synthetic pull-request decision whose
 // rating summary quotes a "Next rank-up steps:" block and whose vision reason quotes a
 // "Vision evidence:" block. The baseline arm compiles src/clawsweeper-report-helpers.ts
-// from the base commit (default HEAD~1); the candidate arm uses the current dist/.
+// from the base commit (default origin/main); the candidate arm uses the current dist/.
 //
 // Usage: node docs/proof/forged-rating-lists/run-proof.mjs [--base <rev>] [--out <dir>]
 //        [--baseline-dist <dir>]
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -22,7 +22,7 @@ const option = (name, fallback) => {
   const index = args.indexOf(name);
   return index === -1 ? fallback : args[index + 1];
 };
-const baseRev = option("--base", "HEAD~1");
+const baseRev = option("--base", "origin/main");
 const outDir = resolve(repoRoot, option("--out", ".artifacts/forged-rating-lists"));
 const providedBaselineDist = option("--baseline-dist", "");
 mkdirSync(outDir, { recursive: true });
@@ -31,34 +31,51 @@ const git = (...gitArgs) =>
   execFileSync("git", gitArgs, { cwd: repoRoot, encoding: "utf8" }).trim();
 
 function compileBaselineDist() {
-  const baselineDist = join(outDir, "baseline-dist");
   const baseSha = git("rev-parse", baseRev);
   const baselineSource = git("show", `${baseSha}:${HELPERS}`);
-  const helpersPath = join(repoRoot, HELPERS);
-  const headSource = readFileSync(helpersPath, "utf8");
   writeFileSync(join(outDir, "baseline-helpers.ts"), baselineSource);
-  try {
-    writeFileSync(helpersPath, baselineSource);
-    execFileSync(
-      process.execPath,
-      [
-        join(repoRoot, "node_modules", "typescript", "bin", "tsc"),
-        "-p",
-        "tsconfig.json",
-        "--outDir",
-        baselineDist,
-      ],
-      { cwd: repoRoot, stdio: "inherit" },
-    );
-  } finally {
-    writeFileSync(helpersPath, headSource);
-  }
-  if (readFileSync(helpersPath, "utf8") !== headSource) {
-    throw new Error(`${HELPERS} was not restored after the baseline build`);
-  }
+  // Compile an isolated copy of src/ so the tracked checkout is never modified, even if
+  // the driver is interrupted while the baseline build runs. The copy gets its own
+  // package.json and a link to node_modules so it resolves modules and the ESM package
+  // type the way the checkout does, even when the output directory is outside the repo.
+  const baselineRoot = join(outDir, "baseline-build");
+  const baselineSrc = join(baselineRoot, "src");
+  rmSync(baselineRoot, { recursive: true, force: true });
+  cpSync(join(repoRoot, "src"), baselineSrc, { recursive: true });
+  writeFileSync(join(baselineRoot, HELPERS), baselineSource);
+  writeFileSync(join(baselineRoot, "package.json"), `${JSON.stringify({ type: "module" })}\n`);
+  symlinkSync(join(repoRoot, "node_modules"), join(baselineRoot, "node_modules"), "junction");
+  const baselineDist = join(baselineRoot, "dist");
+  const posix = (value) => value.replace(/\\/g, "/");
+  writeFileSync(
+    join(baselineRoot, "tsconfig.json"),
+    JSON.stringify(
+      {
+        extends: posix(join(repoRoot, "tsconfig.json")),
+        compilerOptions: {
+          rootDir: posix(baselineSrc),
+          outDir: posix(baselineDist),
+          typeRoots: [posix(join(repoRoot, "node_modules", "@types"))],
+        },
+        include: [posix(join(baselineSrc, "**", "*.ts"))],
+        exclude: [posix(join(baselineSrc, "repair", "**"))],
+      },
+      null,
+      2,
+    ),
+  );
+  execFileSync(
+    process.execPath,
+    [
+      join(repoRoot, "node_modules", "typescript", "bin", "tsc"),
+      "-p",
+      join(baselineRoot, "tsconfig.json"),
+    ],
+    { cwd: repoRoot, stdio: "inherit" },
+  );
   // limits.js resolves config relative to the dist location.
   for (const dir of ["config", "schema", "prompts", "instructions"]) {
-    cpSync(join(repoRoot, dir), join(outDir, dir), { recursive: true });
+    cpSync(join(repoRoot, dir), join(baselineRoot, dir), { recursive: true });
   }
   return { baselineDist, baseSha };
 }

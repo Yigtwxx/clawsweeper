@@ -537,14 +537,29 @@ test("review candidates start lazily and deferred items cannot remain active", (
     "preparePullRequestReviewTree(headSha)",
     contextCollection,
   );
-  const modelReview = source.indexOf("decision = runCodex({", sourceAvailabilityGate);
+  const modelAdmission = source.indexOf("decision = produceReviewOutput(", sourceAvailabilityGate);
+  const modelReview = source.indexOf("runCodex({", modelAdmission);
   assert.ok(materializationHelper >= 0);
   assert.ok(exactHeadMaterialization > materializationHelper);
   assert.ok(contextCollection >= 0);
   assert.ok(sourceAvailabilityGate > contextCollection);
-  assert.ok(modelReview > sourceAvailabilityGate);
+  assert.ok(modelAdmission > sourceAvailabilityGate);
+  assert.ok(modelReview > modelAdmission);
+  const logPublication = source.indexOf("recordReviewLogPublication({", modelReview);
+  const itemCompletion = source.indexOf("finishReviewActionLedgerItem({", logPublication);
+  const liveOutputBudget = source.indexOf("assertCurrentOutputBudget()", itemCompletion);
+  const itemPruning = source.indexOf("pruneItemOutput(reportPath)", itemCompletion);
+  assert.ok(logPublication > modelReview);
+  assert.ok(itemCompletion > logPublication);
+  assert.ok(liveOutputBudget > itemCompletion);
+  assert.ok(itemPruning > liveOutputBudget);
+  const failureSummary = source.slice(
+    source.indexOf("if (codexFailures > 0) {", itemPruning),
+    source.indexOf("finishReviewActionLedger({", itemPruning),
+  );
+  assert.doesNotMatch(failureSummary, /readFileSync\(reportPath/);
   const reviewCatchStart = source.indexOf(
-    "} catch (error) {\n      if (reviewLedger) {",
+    "} catch (error) {\n      commandError = error;",
     reviewCommandStart,
   );
   const reviewCatch = source.slice(

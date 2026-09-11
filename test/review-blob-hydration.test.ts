@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import {
   chmodSync,
   existsSync,
@@ -10,27 +11,34 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import {
   ensurePullRequestReviewHead,
   ensureReviewTreeCommit,
   githubReviewBlobSizes,
+  githubReviewTreeBlobSizes,
   hydratePullRequestReviewBlobs,
   hydratePullRequestReviewHistory,
   materializePullRequestReviewTree,
+  materializePullRequestReviewTreeForTest,
   removePullRequestReviewTree,
+  REVIEW_TREE_MAX_BYTES,
   ReviewGitError,
 } from "../dist/clawsweeper-review-blobs.js";
 import { MAX_SCAN_BYTES } from "../dist/agent-input-scan.js";
 import { createContextHydration } from "../dist/clawsweeper-context-hydration.js";
+import { createGitHubRuntime } from "../dist/clawsweeper-github-runtime.js";
 import { asRecord } from "../dist/clawsweeper-item-policy.js";
 import { createReviewRuntime } from "../dist/clawsweeper-review-runtime.js";
+import { main, reviewPolicyHashForTest } from "../dist/clawsweeper-runtime.js";
 import { runText } from "../dist/command.js";
 import { readReviewGit, reviewMergeBase } from "../dist/pr-review-evidence.js";
 import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
+import { withMockGh } from "./helpers.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -54,11 +62,13 @@ function partialCloneFixture({
   largeFiles = [],
   prefetchHead = true,
   historicalBase = false,
+  attributes = false,
 }: {
   extraFiles?: number;
   largeFiles?: number[];
   prefetchHead?: boolean;
   historicalBase?: boolean;
+  attributes?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-review-promisor-"));
   const origin = join(root, "origin.git");
@@ -97,6 +107,7 @@ function partialCloneFixture({
   mkdirSync(join(source, "nested"));
   writeFileSync(join(source, "nested", "feature[1].txt"), "nested literal\n");
   writeFileSync(join(source, ":(glob)literal.txt"), "pathspec literal\n");
+  if (attributes) writeFileSync(join(source, ".gitattributes"), "*.txt -text\n");
   for (let index = 0; index < extraFiles; index += 1) {
     writeFileSync(join(source, `additional-${index}.txt`), `additional ${index}\n`);
   }
@@ -183,6 +194,24 @@ function objectExistsOffline(cwd: string, sha: string): boolean {
       stdio: "ignore",
     }).status === 0
   );
+}
+
+function populateFixtureHeadBlobs(source: string, target: string, headSha: string): void {
+  const entries = git(
+    source,
+    "ls-tree",
+    "-r",
+    "--format=%(objectmode) %(objectname)",
+    headSha,
+  ).split("\n");
+  for (const entry of entries) {
+    const [mode, objectId] = entry.split(" ");
+    if (!["100644", "100755", "120000"].includes(mode ?? "") || !objectId) continue;
+    execFileSync("git", ["cat-file", "blob", objectId], {
+      cwd: target,
+      stdio: "ignore",
+    });
+  }
 }
 
 // Shallow fixtures must acquire complete ancestry without truncating history
@@ -690,6 +719,7 @@ test("restricted review materializes the exact pull request head before model ex
     assert.equal(objectExistsOffline(fixture.target, fixture.headSha), false);
     assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
     assert.equal(readFileSync(join(fixture.target, "changed.txt"), "utf8"), "before\n");
+    populateFixtureHeadBlobs(fixture.source, fixture.target, fixture.headSha);
 
     assert.equal(
       materializePullRequestReviewTree({
@@ -697,6 +727,7 @@ test("restricted review materializes the exact pull request head before model ex
         worktreeDir: reviewTree,
         itemNumber: 982,
         headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
       }),
       true,
     );
@@ -718,6 +749,568 @@ test("restricted review materializes the exact pull request head before model ex
     );
     assert.equal(existsSync(reviewTree), false);
   } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("manual live proof admits pinned promisor trees with the requested repository and restores its profile", async (t) => {
+  for (const scenario of ["admitted", "missing", "truncated", "overflow", "unavailable"] as const) {
+    await t.test(scenario, async (t) => {
+      const fixture = partialCloneFixture({ attributes: true });
+      const previousInvocation = process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION;
+      t.after(() => {
+        t.mock.restoreAll();
+        syncBuiltinESMExports();
+        if (previousInvocation === undefined)
+          delete process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION;
+        else process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION = previousInvocation;
+        rmSync(fixture.root, { recursive: true, force: true });
+      });
+      const repo =
+        process.env.CLAWSWEEPER_TARGET_REPO === "openclaw/clawsweeper"
+          ? "openclaw/openclaw"
+          : "openclaw/clawsweeper";
+      const records = join(fixture.root, "records");
+      const output = join(fixture.root, "output");
+      mkdirSync(records);
+      writeFileSync(
+        join(records, "982.md"),
+        `---\nnumber: 982\nrepository: ${repo}\ntype: pull_request\npull_head_sha: ${fixture.headSha}\n---\n\n## Live Proof\n\nStatus: recommended\n\nSurface: terminal\n\nTerminal completion: exit_zero\n\nReason: Verify the pinned fixture.\n\nPayoff: static_text\n\nPayoff justification: Text is sufficient.\n\nEntry: printf fixture-ready\n\nSteps:\n\n- {"action":"expect_output","text":"fixture-ready"}\n\n## Work Candidate\n\nCandidate: none\n`,
+      );
+      const tree = git(
+        fixture.source,
+        "ls-tree",
+        "-r",
+        "--format=%(objecttype) %(objectname) %(objectsize)",
+        fixture.headSha,
+      )
+        .split("\n")
+        .map((line) => {
+          const [type, sha, size] = line.split(" ");
+          return { type, sha, size: Number(size) };
+        });
+      const attributes = git(fixture.source, "rev-parse", `${fixture.headSha}:.gitattributes`);
+      writeFileSync(join(fixture.target, "changed.txt"), "unreviewed checkout must not execute\n");
+      const statusBefore = git(fixture.target, "status", "--porcelain");
+      const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+      const profileBefore = reviewPolicyHashForTest();
+      assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+      let metadataCalls = 0;
+      let childLaunches = 0;
+      t.mock.method(console, "log", () => {});
+      const nativeSpawn = childProcess.spawnSync;
+      t.mock.method(childProcess, "spawnSync", (...args: Parameters<typeof nativeSpawn>) => {
+        const argv = args[1] ?? [];
+        if (argv[0] === "api") {
+          metadataCalls++;
+          assert.deepEqual(argv.slice(0, 2), [
+            "api",
+            `repos/${repo}/git/trees/${fixture.headSha}?recursive=1`,
+          ]);
+          assert.notEqual(reviewPolicyHashForTest(), profileBefore);
+          assert.ok(args[2]?.timeout && args[2].timeout <= 30_000);
+          if (scenario === "unavailable") throw new Error("fixture metadata unavailable");
+          const response = {
+            truncated: scenario === "truncated",
+            tree: tree
+              .filter((entry) => scenario !== "missing" || entry.sha !== fixture.addedBlobSha)
+              .map((entry) =>
+                scenario === "overflow" && entry.type === "blob" && entry.sha !== attributes
+                  ? { ...entry, size: REVIEW_TREE_MAX_BYTES / 4 }
+                  : entry,
+              ),
+          };
+          const filter = argv.indexOf("--jq");
+          return filter < 0
+            ? { status: 0, stdout: JSON.stringify(response), stderr: "" }
+            : nativeSpawn("jq", ["-c", argv[filter + 1]!], {
+                ...args[2],
+                input: JSON.stringify(response),
+                stdio: ["pipe", "pipe", "pipe"],
+              });
+        }
+        if (args[0] === process.execPath && argv[1] === "live-proof") {
+          childLaunches++;
+          assert.equal(reviewPolicyHashForTest(), profileBefore);
+          assert.equal(argv[argv.indexOf("--repo") + 1], repo);
+          const checkout = String(args[2]?.cwd);
+          assert.equal(git(checkout, "rev-parse", "HEAD"), fixture.headSha);
+          assert.equal(readFileSync(join(checkout, "changed.txt"), "utf8"), "after\n");
+          writeFileSync(
+            join(argv[argv.indexOf("--output") + 1]!, "live-verification.json"),
+            JSON.stringify({ head_sha: fixture.headSha, repo }),
+          );
+          return {
+            status: 0,
+            stdout: "[live-proof] sanitized environment assertion passed: credentials=0\n",
+            stderr: "",
+          };
+        }
+        assert.equal(args[0], "git", "unexpected external command");
+        return nativeSpawn(...args);
+      });
+      syncBuiltinESMExports();
+      const execution = main(
+        [
+          "live-proof-review",
+          "--repo",
+          repo,
+          "--records-dir",
+          records,
+          "--checkout",
+          fixture.target,
+          "--output",
+          output,
+          "--item",
+          "982",
+        ],
+        { flushWorkflowActionEvents: async () => [] },
+      );
+      if (scenario === "admitted") {
+        await execution;
+        assert.equal(childLaunches, 1);
+        assert.deepEqual(
+          JSON.parse(readFileSync(join(output, "982", "live-verification.json"), "utf8")),
+          { head_sha: fixture.headSha, repo },
+        );
+      } else {
+        await assert.rejects(execution, (error: unknown) => {
+          assert.ok(error instanceof ReviewSourcePreparationError);
+          assert.equal(error.diagnosticReason, "review_checkout_unavailable");
+          assert.match(
+            error.message,
+            scenario === "overflow"
+              ? /conservatively projected bytes/
+              : /remote blob size metadata is (?:unavailable|incomplete)/,
+          );
+          return true;
+        });
+        assert.equal(childLaunches, 0);
+        assert.equal(existsSync(output), false);
+        assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+      }
+      // Attributes and content request separate size sets but share one pinned tree response.
+      assert.equal(metadataCalls, 1);
+      assert.equal(reviewPolicyHashForTest(), profileBefore);
+      assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+      assert.equal(git(fixture.target, "status", "--porcelain"), statusBefore);
+      assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+      assert.equal(
+        readFileSync(join(fixture.target, "changed.txt"), "utf8"),
+        "unreviewed checkout must not execute\n",
+      );
+    });
+  }
+});
+
+test("restricted review rejects one tracked 2.5 GiB blob before worktree materialization", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "oversized-tree");
+  try {
+    const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.target,
+            worktreeDir: reviewTree,
+            itemNumber: 982,
+            headSha: fixture.headSha,
+          },
+          {
+            maxFiles: 200_000,
+            maxBytes: 2 * 1024 * 1024 * 1024,
+            diskReserveBytes: 1024 * 1024 * 1024,
+            diskCapacity: {
+              workspaceAvailableBytes: 3 * 1024 * 1024 * 1024,
+              objectStoreAvailableBytes: 3 * 1024 * 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+          {
+            paths: ["oversized.bin"],
+            blobBytes: BigInt(2.5 * 1024 * 1024 * 1024),
+          },
+        ),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /conservatively projected bytes/.test(error.message),
+    );
+    assert.equal(existsSync(reviewTree), false);
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review admits shared and separate filesystem budgets independently", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+  const missingBlob = "a".repeat(40);
+  const scenarios = [
+    {
+      name: "shared",
+      worktreeDir: join(fixture.root, "shared-capacity-tree"),
+      blobBytes: 40n,
+      missingBytes: 30,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 100,
+        objectStoreAvailableBytes: 100,
+        sameFileSystem: true,
+      },
+      message: /shared-filesystem bytes/,
+    },
+    {
+      name: "workspace",
+      worktreeDir: join(fixture.root, "workspace-capacity-tree"),
+      blobBytes: 50n,
+      missingBytes: 1,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 109,
+        objectStoreAvailableBytes: 1_000,
+        sameFileSystem: false,
+      },
+      message: /workspace bytes/,
+    },
+    {
+      name: "object store",
+      worktreeDir: join(fixture.root, "object-capacity-tree"),
+      blobBytes: 1n,
+      missingBytes: 100,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 1_000,
+        objectStoreAvailableBytes: 109,
+        sameFileSystem: false,
+      },
+      message: /object-store bytes/,
+    },
+  ] as const;
+  try {
+    for (const scenario of scenarios) {
+      assert.throws(
+        () =>
+          materializePullRequestReviewTreeForTest(
+            {
+              targetDir: fixture.target,
+              worktreeDir: scenario.worktreeDir,
+              itemNumber: 982,
+              headSha: fixture.headSha,
+            },
+            {
+              maxFiles: 100,
+              maxBytes: 1_000,
+              diskReserveBytes: scenario.reserveBytes,
+              diskCapacity: scenario.capacity,
+            },
+            {
+              paths: ["fixture.txt"],
+              blobBytes: scenario.blobBytes,
+              missingBlobs: [{ objectId: missingBlob, bytes: scenario.missingBytes }],
+            },
+          ),
+        (error) =>
+          error instanceof ReviewSourcePreparationError &&
+          error.diagnosticReason === "review_checkout_unavailable" &&
+          scenario.message.test(error.message),
+        scenario.name,
+      );
+      assert.equal(existsSync(scenario.worktreeDir), false, scenario.name);
+    }
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review rejects oversized remote blob metadata before fetching or checkout", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "oversized-remote-tree");
+  try {
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+          resolveBlobSizes: (objectIds) =>
+            new Map(objectIds.map((objectId) => [objectId, 2.5 * 1024 * 1024 * 1024])),
+        }),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /conservatively projected bytes/.test(error.message),
+    );
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    assert.equal(existsSync(reviewTree), false);
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review hydrates only bounded attributes before rejecting a remote filter", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "filtered-remote-tree");
+  try {
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure remote checkout filter");
+    const headSha = git(fixture.source, "rev-parse", "HEAD");
+    git(fixture.source, "push", "-q", "--force", "origin", "HEAD:refs/pull/982/head");
+    const requested: string[][] = [];
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha,
+          resolveBlobSizes: (objectIds) => {
+            requested.push([...objectIds]);
+            return resolveFixtureBlobSizes(fixture.source)(objectIds);
+          },
+        }),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /unbounded filter/.test(error.message),
+    );
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0]!.length, 1);
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    assert.equal(existsSync(reviewTree), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review refuses unbounded filters and admits bounded EOL expansion", () => {
+  const fixture = partialCloneFixture();
+  const rejectedTree = join(fixture.root, "filtered-tree");
+  const admittedTree = join(fixture.root, "eol-tree");
+  const filterMarker = join(fixture.root, "filter-ran");
+  const hookMarker = join(fixture.root, "hook-ran");
+  try {
+    git(
+      fixture.source,
+      "config",
+      "filter.inflate.smudge",
+      `/usr/bin/touch ${filterMarker}; /bin/cat`,
+    );
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure checkout filter");
+    const filteredHead = git(fixture.source, "rev-parse", "HEAD");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.source,
+            worktreeDir: rejectedTree,
+            itemNumber: 982,
+            headSha: filteredHead,
+          },
+          {
+            maxFiles: 100,
+            maxBytes: 1024 * 1024,
+            diskReserveBytes: 0,
+            diskCapacity: {
+              workspaceAvailableBytes: 1024 * 1024,
+              objectStoreAvailableBytes: 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+        ),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /unbounded filter/.test(error.message),
+    );
+    assert.equal(existsSync(rejectedTree), false);
+    assert.equal(existsSync(filterMarker), false);
+
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt text eol=crlf\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "use bounded EOL conversion");
+    const eolHead = git(fixture.source, "rev-parse", "HEAD");
+    const postCheckoutHook = join(fixture.source, ".git", "hooks", "post-checkout");
+    writeFileSync(postCheckoutHook, `#!/bin/sh\n/usr/bin/touch ${hookMarker}\n`);
+    chmodSync(postCheckoutHook, 0o755);
+    assert.equal(
+      materializePullRequestReviewTreeForTest(
+        {
+          targetDir: fixture.source,
+          worktreeDir: admittedTree,
+          itemNumber: 982,
+          headSha: eolHead,
+        },
+        {
+          maxFiles: 100,
+          maxBytes: 1024 * 1024,
+          diskReserveBytes: 0,
+          diskCapacity: {
+            workspaceAvailableBytes: 1024 * 1024,
+            objectStoreAvailableBytes: 1024 * 1024,
+            sameFileSystem: true,
+          },
+        },
+      ),
+      true,
+    );
+    assert.match(readFileSync(join(admittedTree, "changed.txt"), "utf8"), /\r\n$/);
+    assert.equal(existsSync(hookMarker), false);
+  } finally {
+    removePullRequestReviewTree({ targetDir: fixture.source, worktreeDir: admittedTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review uses a private Git 2.39-compatible attribute index and cleans it", () => {
+  const fixture = partialCloneFixture();
+  const reviewTreesDir = join(fixture.root, "review-trees");
+  const reviewTree = join(reviewTreesDir, "filtered-tree");
+  const binDir = join(fixture.root, "bin");
+  const commandLog = join(fixture.root, "git-commands.log");
+  const indexLog = join(fixture.root, "git-indexes.log");
+  const hookMarker = join(fixture.root, "post-index-change-ran");
+  const fsmonitorMarker = join(fixture.root, "fsmonitor-ran");
+  const previousPath = process.env.PATH;
+  try {
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure checkout filter");
+    const filteredHead = git(fixture.source, "rev-parse", "HEAD");
+    const hooksDir = join(fixture.root, "hooks");
+    mkdirSync(hooksDir);
+    writeFileSync(
+      join(hooksDir, "post-index-change"),
+      `#!/bin/sh\n/usr/bin/touch ${JSON.stringify(hookMarker)}\n`,
+    );
+    chmodSync(join(hooksDir, "post-index-change"), 0o755);
+    git(fixture.source, "config", "core.hooksPath", hooksDir);
+    const fsmonitor = join(fixture.root, "fsmonitor");
+    writeFileSync(
+      fsmonitor,
+      `#!/bin/sh\n/usr/bin/touch ${JSON.stringify(fsmonitorMarker)}\nprintf 'builtin:fake\\n'\n`,
+    );
+    chmodSync(fsmonitor, 0o755);
+    git(fixture.source, "config", "core.fsmonitor", fsmonitor);
+    mkdirSync(reviewTreesDir);
+    mkdirSync(binDir);
+    const shim = join(binDir, "git");
+    writeFileSync(
+      shim,
+      `#!/bin/sh
+printf '%s\n' "$*" >> ${JSON.stringify(commandLog)}
+for arg in "$@"; do
+  case "$arg" in
+    --source=*) exit 97 ;;
+  esac
+done
+case "$*" in
+  *" read-tree "*|*" check-attr "*)
+    printf '%s\n' "$GIT_INDEX_FILE" >> ${JSON.stringify(indexLog)}
+    ;;
+esac
+exec /usr/bin/git "$@"
+`,
+    );
+    chmodSync(shim, 0o755);
+    process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.source,
+            worktreeDir: reviewTree,
+            itemNumber: 982,
+            headSha: filteredHead,
+          },
+          {
+            maxFiles: 100,
+            maxBytes: 1024 * 1024,
+            diskReserveBytes: 0,
+            diskCapacity: {
+              workspaceAvailableBytes: 1024 * 1024,
+              objectStoreAvailableBytes: 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+        ),
+      /unbounded filter/,
+    );
+    const commands = readFileSync(commandLog, "utf8");
+    assert.match(
+      commands,
+      /-c core\.hooksPath=\S+ -c core\.fsmonitor=false -c core\.splitIndex=false read-tree/,
+    );
+    assert.match(
+      commands,
+      /-c core\.hooksPath=\S+ -c core\.fsmonitor=false -c core\.splitIndex=false check-attr --cached/,
+    );
+    assert.doesNotMatch(commands, /--source=/);
+    assert.equal(existsSync(hookMarker), false);
+    assert.equal(existsSync(fsmonitorMarker), false);
+    const indexPaths = readFileSync(indexLog, "utf8").trim().split("\n");
+    assert.ok(indexPaths.length >= 2);
+    for (const indexPath of indexPaths) {
+      assert.ok(indexPath.startsWith(`${reviewTreesDir}/.clawsweeper-attributes-`));
+      assert.equal(existsSync(indexPath), false);
+      assert.equal(existsSync(join(indexPath, "..")), false);
+    }
+    assert.equal(existsSync(reviewTree), false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review treats zero inode statistics as unavailable", () => {
+  const fixture = partialCloneFixture();
+  const reviewTree = join(fixture.root, "zero-inode-tree");
+  const originalStatfsSync = fs.statfsSync;
+  try {
+    fs.statfsSync = ((path, options) => {
+      const result = originalStatfsSync(path, options as never);
+      return { ...result, files: 0, ffree: 0 };
+    }) as typeof fs.statfsSync;
+    syncBuiltinESMExports();
+    assert.equal(
+      materializePullRequestReviewTreeForTest(
+        {
+          targetDir: fixture.source,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+        },
+        {
+          maxFiles: 100,
+          maxBytes: 1024 * 1024,
+          diskReserveBytes: 0,
+          diskCapacity: {
+            workspaceAvailableBytes: 1024 * 1024,
+            objectStoreAvailableBytes: 1024 * 1024,
+            sameFileSystem: true,
+          },
+        },
+      ),
+      true,
+    );
+  } finally {
+    fs.statfsSync = originalStatfsSync;
+    syncBuiltinESMExports();
+    removePullRequestReviewTree({ targetDir: fixture.source, worktreeDir: reviewTree });
     rmSync(fixture.root, { recursive: true, force: true });
   }
 });
@@ -929,18 +1522,24 @@ test("source preparation reports unavailable historical blobs before restricted 
         isSafeGitBranchName: (branch: string) => branch === "main",
         targetRepo: () => "fixture/repository",
         ghJson: (args: string[]) => {
-          const query = args.find((arg) => arg.startsWith("query="));
-          assert.ok(query);
-          const ids = [...query.matchAll(/b(\d+): object\(oid: "([0-9a-f]+)"\)/g)];
-          assert.ok(ids.length);
-          const sizes = resolveFixtureBlobSizes(fixture.source)(ids.map((match) => match[2]!));
-          return {
-            data: {
-              repository: Object.fromEntries(
-                ids.map((match) => ["b" + match[1], { byteSize: sizes.get(match[2]!) }]),
-              ),
-            },
-          };
+          assert.equal(args[0], "api");
+          assert.deepEqual(args.slice(2), [
+            "--jq",
+            '{truncated, tree: (.tree | if type == "array" then map(if type == "object" then {type, sha, size} else . end) else . end)}',
+          ]);
+          const revision = args[1]?.match(/\/git\/trees\/([0-9a-f]+)\?recursive=1$/)?.[1];
+          assert.ok(revision);
+          const tree = git(fixture.source, "ls-tree", "-r", "-l", revision)
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => {
+              const match = line.match(/^\d+ (\w+) ([0-9a-f]+)\s+(-|\d+)\t/);
+              assert.ok(match);
+              return match[1] === "blob"
+                ? { type: "blob", sha: match[2], size: Number(match[3]) }
+                : { type: match[1], sha: match[2] };
+            });
+          return { truncated: false, tree };
         },
       },
       { get: (target, key) => Reflect.get(target, key) ?? unavailable },
@@ -1065,6 +1664,148 @@ test("review blob sizes use one bounded GraphQL metadata request", () => {
   );
 });
 
+test("review checkout preserves large tree metadata within the GitHub CLI capture limit", () => {
+  const fixture = partialCloneFixture();
+  const reviewTree = join(fixture.root, "review-tree");
+  const metadataPath = join(fixture.root, "tree.json");
+  const tree = git(fixture.source, "ls-tree", "-rl", fixture.headSha)
+    .split("\n")
+    .map((line) => {
+      const match = /^(\d+) (\w+) ([0-9a-f]+)\s+(\d+|-)\t(.+)$/.exec(line);
+      assert.ok(match);
+      return {
+        mode: match[1],
+        type: match[2],
+        sha: match[3],
+        size: match[4] === "-" ? null : Number(match[4]),
+        path: match[5],
+        url: `https://api.github.com/repos/fixture/repository/git/blobs/${match[3]}`,
+      };
+    });
+  for (let index = 0; index < 33_000; index += 1) {
+    const sha = index.toString(16).padStart(40, "0");
+    tree.push({
+      mode: "100644",
+      type: "blob",
+      sha,
+      size: index + 1,
+      path: `synthetic/packages/${index}/${"segment/".repeat(20)}entry.ts`,
+      url: `https://api.github.com/repos/fixture/repository/git/blobs/${sha}`,
+    });
+  }
+  const metadata = { truncated: false, tree };
+  const raw = JSON.stringify(metadata);
+  assert.ok(Buffer.byteLength(raw) > 8 * 1024 * 1024);
+  writeFileSync(metadataPath, raw);
+  const unavailable = () => {
+    throw new Error("Unexpected dependency in tree metadata fixture");
+  };
+  let captured: typeof metadata | undefined;
+  const runtime = createGitHubRuntime({
+    ROOT: fixture.root,
+    run: unavailable,
+    targetRepo: () => "fixture/repository",
+  });
+  const context = createContextHydration(
+    new Proxy(
+      {
+        asRecord,
+        targetRepo: () => "fixture/repository",
+        ghJsonOnce: (args: string[], timeoutMs: number) => {
+          const output = runtime.ghOnce(args, timeoutMs);
+          assert.ok(Buffer.byteLength(output) < 8 * 1024 * 1024);
+          captured = JSON.parse(output);
+          return captured;
+        },
+      },
+      { get: (target, key) => Reflect.get(target, key) ?? unavailable },
+    ) as Parameters<typeof createContextHydration>[0],
+  );
+  const materialize = () =>
+    context.materializePullRequestReviewTree({
+      targetDir: fixture.target,
+      worktreeDir: reviewTree,
+      itemNumber: 982,
+      headSha: fixture.headSha,
+    });
+  try {
+    withMockGh(
+      fixture.root,
+      `const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const filter = args.indexOf("--jq");
+if (filter < 0) {
+  process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(metadataPath)}));
+} else {
+  const result = spawnSync("jq", ["-c", args[filter + 1], ${JSON.stringify(metadataPath)}], { stdio: "inherit" });
+  process.exitCode = result.status ?? 1;
+}
+`,
+      () => {
+        for (const invalid of [
+          { ...metadata, truncated: true },
+          { truncated: false, tree: { entry: tree[0] } },
+          { truncated: false, tree: [null, ...tree] },
+        ]) {
+          writeFileSync(metadataPath, JSON.stringify(invalid));
+          assert.throws(materialize, { diagnosticReason: "review_checkout_unavailable" });
+          assert.equal(existsSync(reviewTree), false);
+        }
+        writeFileSync(metadataPath, raw);
+        assert.equal(materialize(), true);
+      },
+    );
+    assert.deepEqual(captured, {
+      truncated: false,
+      tree: tree.map(({ type, sha, size }) => ({ type, sha, size })),
+    });
+    assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+    assert.equal(readFileSync(join(reviewTree, "added.txt"), "utf8"), "new implementation\n");
+  } finally {
+    removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review tree blob sizes use one bounded recursive-tree request", () => {
+  const headSha = "a".repeat(40);
+  let requests = 0;
+  const result = githubReviewTreeBlobSizes({
+    repository: "openclaw/clawsweeper",
+    headSha,
+    request: (path) => {
+      requests += 1;
+      assert.equal(path, `repos/openclaw/clawsweeper/git/trees/${headSha}?recursive=1`);
+      return {
+        truncated: false,
+        tree: [
+          { type: "tree", sha: "b".repeat(40) },
+          { type: "blob", sha: "c".repeat(40), size: 12 },
+          { type: "blob", sha: "d".repeat(40), size: 34 },
+        ],
+      };
+    },
+  });
+
+  assert.equal(requests, 1);
+  assert.deepEqual(
+    [...result],
+    [
+      ["c".repeat(40), 12],
+      ["d".repeat(40), 34],
+    ],
+  );
+  assert.throws(
+    () =>
+      githubReviewTreeBlobSizes({
+        repository: "openclaw/clawsweeper",
+        headSha,
+        request: () => ({ truncated: true, tree: [] }),
+      }),
+    /incomplete bounded review tree metadata response/,
+  );
+});
+
 test("large pinned deltas hydrate historical blobs after head checkout and produce the full offline binary patch", (t) => {
   const fixture = partialCloneFixture({
     extraFiles: 170,
@@ -1080,6 +1821,7 @@ test("large pinned deltas hydrate historical blobs after head checkout and produ
         worktreeDir: reviewTree,
         itemNumber: 982,
         headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
       }),
       true,
     );

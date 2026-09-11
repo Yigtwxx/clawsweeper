@@ -7,7 +7,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ## 0.3.1 - Unreleased
 
-**Highlights:** Preserve later review evidence, keep quoted report prose from forging findings, and prevent stalled status updates from blocking review starts.
+**Highlights:** Preserve later review evidence, reject forged report findings, bound stalled repair calls, and recheck paired-close eligibility before mutations.
 
 ### Removed
 
@@ -21,6 +21,12 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Isolate the GitHub ETag cache in repository-sharded Durable Objects so cache reads and writes no longer compete with exact-review admission, claims, or webhooks.
+
+- Refresh durable review freshness after unchanged exact-head re-reviews while preserving idempotent publication retries, and record bounded activity-cursor diagnostics for drift-blocked publication.
+
+- Preserve bounded, recognized command-intake HTTP failure codes in review-request diagnostics without exposing raw responses or changing retry behavior.
+
 - Refresh markdown-it to 15.0.1 and Playwright to 1.63.0, retaining the repository's release-age policy and Node 24 runtime floor.
 
 - Recover failed aggregate review shards only from recognized retryable item terminals in the complete exact-attempt ledger. Keep completed, nonretryable, uncertain, and unstarted items out of recovery, and retain identity- and digest-verified completed reports for normal guarded publication.
@@ -30,7 +36,23 @@ checkpoint, and status-only commits are intentionally omitted.
 - Give Codex reviewers the existing short-lived, read-only target-repository GitHub App token as `GH_TOKEN` for authenticated reads, and describe token availability from the actual reviewer environment, including OpenClaw's credential filter.
 - Give hosted issue/PR reviewers allowlisted public research access through a managed proxy while keeping the checkout read-only; describe token, blocked-host, and downloaded-media capabilities accurately and fail setup when sandbox enforcement regresses.
 - Describe review capabilities from the active runner so OpenClaw gateway execution is not mistaken for the Codex allowlisted sandbox; prove Linux review sandbox enforcement in credential-free PR CI.
-
+- Made persistent local review output opt-in: ordinary local reviews now use
+  private transient scratch by default, explicit summary/debug modes retain
+  bounded output, and hosted review refuses before execution unless its required
+  artifact route explicitly selects debug retention. Required PR checkouts now
+  use a separately admitted private workspace with conservative Git metadata
+  sizing and unbounded filter refusal, and media producers share run-owned byte
+  and file allowances before writing. Existing debug destinations, metadata,
+  cached and fresh reports, and bounded failure diagnostics use the same output
+  admission owner. These limits bound retained managed output, not arbitrary
+  model writes or peak child-process disk use. Managed local sources stay checkout-free until the
+  admitted exact-head materializer runs, Git 2.39-compatible attribute checks
+  use a bounded private index, and non-debug batches prune each item's engine
+  files after ledger evidence is hashed. Ordinary and caught-failure cleanup remains automatic;
+  operating-system signals keep default termination semantics and may leave
+  bounded private scratch. Checkout and Git object-store capacity are admitted
+  separately unless both destinations share a filesystem. Bounded Git reads
+  ignore unconsumed wrapper diagnostics while continuing to cap stdout.
 - Add reviewed-plan retirement of one merged-target publication through the existing maintenance workflow, keeping signing credentials confined to its execution step.
 - Admit the two approved Signal URL-rejection fixtures through exact URI, source-line, path, and native decoder bindings while retaining all scanner and verification checks.
 - Admit the reviewed Crabbox PostgreSQL operations example through exact Postgres detector, observed `PLAIN`/`HTML` decoder, value-hash, source-line, path, mode, metadata, and committed base/head bindings.
@@ -119,6 +141,16 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Retry the pinned control-plane helper download on TLS and connection errors so a single handshake failure no longer drops an exact-review event before enqueue.
+- Keep large repository reviews within the GitHub CLI response limit by projecting recursive-tree metadata before capture, preserving complete blob sizes and strict private-checkout admission.
+
+- Carry the durable review lease through oversized PR close proposals so direct exact publication can close eligible PRs; queued fallback still keeps PRs open with `skipped_changed_since_review` after lease expiry, pending the follow-up to create the final metadata proposal under publication ownership and re-evaluation at the next event or head.
+
+- Accept the exact-event PR admission handoff for mixed-case target repositories such as fallback-profile repos, whose profile slug is lowercased; the strict repo comparison failed every review of such pull requests after the oversized-PR policy landed.
+- Recheck current close policies and known same-author counterparts before close mutations, keeping the parent open when a counterpart locks, reopens, or cannot be refreshed; thanks @vincentkoc.
+- Bound cluster dispatch and target cloning with operator-configured deadlines, useful timeout errors, and clone process-tree cleanup; thanks @SebTardif.
+- Bound cluster-selector model and GitHub requests through response completion, failing without new selection output on stalled transports; thanks @SebTardif.
+- Show later PR review revisions beside the freshness timestamp while preserving same-review resyncs and lifetime history counts; thanks @elijahfriedman.
 - Prevent quoted finding and security-concern prose from adding findings or replacing confidence when durable reviews are parsed again; thanks @Yigtwxx.
 - Preserve later discussion evidence and invalidate cached reviews when omitted inline-comment text changes instead of silently dropping comment tails; thanks @TommyLei666.
 - Mask credentialed URLs in supplementary review context and ignore foreign timeline issue numbers; thanks @yetval.
@@ -127,6 +159,7 @@ checkpoint, and status-only commits are intentionally omitted.
 - Complete exact-review leases during Worker/workflow deploy skew by retrying rejected terminal reasons once without the reason/status, preserving diagnostics and warning operators.
 
 - Stop exact-review retries for every non-retryable scanner refusal, including scan deadlines, and retain terminal guidance for the unchanged revision.
+- Retry transient control-plane failures across exact-review workflow calls, preserve retryable admission 503 responses and Retry-After headers through webhook/internal ingress, and attribute failed fences and reservations to queue infrastructure. Bootstrap pre-checkout helpers with commit-pinned downloads so later full checkouts retain local setup actions, and keep lease cleanup working when checkout is skipped or fails.
 
 - Prepare GitHub user-attachment and legacy repository asset proof locally, resolving image/video types after download and reserving bounded preprocessing time for attachments.
 
@@ -200,6 +233,8 @@ checkpoint, and status-only commits are intentionally omitted.
 - Prevented model-authored report prose and body-shaped front matter from spoofing proof or rating sections, keeping unproven external pull requests in human review instead of routing them into automated repair. (#951)
 
 ### Added
+
+- Propose closing pull requests above 50,000 changed lines before hydration, scanning, or model review, with a configurable threshold, maintainer size exemption, and live-revalidated gated apply that preserves human-activity freshness and queue supersession.
 
 - Enabled browser live proof for ClawSweeper with a self-contained local OpenClaw Bay launcher and seeded lifecycle/workflow demo data.
 - Added an opt-in live-proof lane that records typed browser or terminal plans in a secretless PR-head job, validates and uploads media from a separate trusted job, and attaches only trusted R2 URLs to the durable review comment.

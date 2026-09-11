@@ -60,6 +60,11 @@ repair, GitCrawl intake, durable Codex threads, CrabFleet steering, completion
 gates, quotas, dashboards, and recovery, see
 [`docs/steerable-repair-automation.md`](docs/steerable-repair-automation.md).
 
+The [oversized PR close lane](docs/oversized-pr-close-policy.md) proposes closing
+pull requests above 50,000 changed lines before hydration, scanning, or model
+review, with a maintainer `size: accepted-large` exemption. See the
+[close-policy index](docs/README.md#close-policy) for the guarded close lanes.
+
 ClawSweeper is not a generic auto-close bot. Review is proposal-only, apply is
 guarded, Codex never gets write credentials during review, and every GitHub
 mutation is rechecked against live target state immediately before it happens.
@@ -73,6 +78,11 @@ forward exact issue/PR events with `repository_dispatch` for low-latency
 one-item reviews. Each review writes
 `records/<repo-slug>/items/<number>.md` with the decision, evidence, proposed
 maintainer-facing comment, runtime metadata, and GitHub snapshot hash.
+
+PR checkout preparation captures only the recursive tree's entry types, object
+IDs, sizes, and truncation flag from the GitHub CLI. This keeps path and URL
+metadata from exhausting the response buffer while preserving the existing
+checkout size limits and rejection of incomplete or malformed trees.
 
 Media proof preparation recognizes image/video filename extensions and GitHub
 attachment URLs, including legacy repository asset links. Attachments are fetched
@@ -779,7 +789,7 @@ corepack enable
 pnpm install
 pnpm run build
 pnpm run plan -- --target-repo openclaw/openclaw --batch-size 5 --shard-count 22 --max-pages 250 --codex-model internal --codex-reasoning-effort high
-pnpm run review -- --target-repo openclaw/openclaw --target-dir ../openclaw --batch-size 5 --max-pages 250 --artifact-dir artifacts/reviews --codex-model internal --codex-reasoning-effort high --codex-timeout-ms 600000
+pnpm run review -- --target-repo openclaw/openclaw --target-dir ../openclaw --batch-size 5 --max-pages 250 --artifact-dir artifacts/reviews --output-retention debug --codex-model internal --codex-reasoning-effort high --codex-timeout-ms 600000
 pnpm run apply-artifacts -- --target-repo openclaw/openclaw --artifact-dir artifacts/reviews --skip-dashboard
 pnpm run audit -- --target-repo openclaw/openclaw --max-pages 250 --sample-limit 25 --update-dashboard
 pnpm run reconcile -- --target-repo openclaw/openclaw --dry-run
@@ -800,17 +810,48 @@ pnpm run review -- --local-only --target-repo owner/name --item-number 123
 
 `review` is the single issue/PR review command. `--local-only` makes it an
 advisory local run: it skips the review-start placeholder comment, defaults the
-Codex service tier to `fast` for local CLI compatibility, preserves local Codex
-auth, and leaves generated output under the selected artifact directory. With a
-single `--item-number` and no `--target-dir`, it creates a managed PR checkout
-under `artifacts/local-review-<number>/target`. To use an already-cloned
-checkout, or to review an issue, pass `--target-dir <path>`:
+Codex service tier to `fast` for local CLI compatibility, and preserves local
+Codex auth. Persistent output is opt-in. The default `--output-retention none`
+uses private run-owned scratch, prints the result, and removes scratch after
+ordinary completion or a caught failure. Operating-system termination keeps its
+default behavior so cancellation is not delayed by synchronous review work; an
+unhandled signal or `SIGKILL` can leave the bounded private scratch behind. Use
+`--output-retention summary` for the report
+without raw prompt/stream files, or `--output-retention debug` for the existing
+artifact tree. An explicit legacy `--artifact-dir` still selects debug
+retention. Summary destinations are created exclusively for one invocation.
+Managed transient output is capped at 96 MiB/256 files; managed debug output is capped at
+1 GiB/4,096 files with per-item allocations and at most 128 selected items per
+invocation. Existing destination files count toward these limits. Metadata,
+cached and fresh reports, and model output use the same run admission checks.
+None and summary batches hash each item's report and stream evidence
+into the canonical ledger before pruning that item's run-owned engine files;
+summary retains only the reports. Required pull-request checkouts use a separate private run workspace:
+tracked paths and Git blob sizes are admitted before materialization, with a 2x
+allowance for bounded EOL expansion. Active filters, working-tree encodings, and
+ident expansion are refused through a bounded private Git index compatible with
+Git 2.39. That index reserves at most two files/128 MiB plus the workspace disk
+reserve before creation and is removed after inspection. Checkout hooks are disabled. Projected and
+actual checkout usage is capped at 200,000 files/2 GiB, and 1 GiB remains
+reserved on each filesystem used for checkout materialization or missing Git
+object acquisition; a shared filesystem is charged once. Media proof downloads
+use at most 64 MiB per debug item and derived metadata/contact sheets at most
+16 MiB, subject to the remaining run byte and file allowances. Non-debug items
+use at most 32 MiB and 8 MiB respectively. Media admission reserves the non-media
+output pools before starting another download or transcode. These are producer
+admission and retained-output limits, not a peak disk quota: curl and ffmpeg can
+temporarily exceed their requested limits, and arbitrary model-written files
+are not quota-controlled. Oversized managed media output is discarded.
+Existing or unrelated retained runs are
+never pruned automatically.
+`--result-format json` returns the same result as valid JSON.
 
 ```bash
 pnpm run review -- --local-only \
   --target-repo owner/name \
   --item-number 123 \
-  --target-dir ../target-checkout
+  --target-dir ../target-checkout \
+  --output-retention summary
 ```
 
 Pre-submission committed-range review uses the same full proof-aware review
@@ -830,23 +871,26 @@ committed work only, and refuses a dirty working tree. `--body-file` can supply
 the proposed PR body and `--additional-policy` can layer an extra local policy.
 
 This mode withholds GitHub token variables, points `gh` at an empty config
-directory inside the run artifacts, disables Codex web search, skips host-side
+directory inside private run scratch, disables Codex web search, skips host-side
 URL/media preprocessing, and makes no GitHub reads or writes. It is not
 air-gapped: the Codex model invocation still uses its configured network
-service. Repeated local reviews preserve the latest local result in the same
-bounded review-history format used by hosted review. The next run receives the
-previous findings and dispositions so it can verify fixes and avoid re-raising
-resolved findings. Exact-item history stays in the selected artifact directory.
-Committed-range history stays under `.git/clawsweeper/reviews/` and is reused
+service. Debug local reviews preserve the latest local result in the same
+bounded review-history format used by hosted review. The next debug run receives
+the previous findings and dispositions so it can verify fixes and avoid
+re-raising resolved findings. Summary retention keeps only the current reports.
+In debug mode, exact-item history stays in the selected artifact directory.
+Committed-range debug history stays under `.git/clawsweeper/reviews/` and is reused
 only for the same target repository and resolved base when its reviewed commit
 is an ancestor of the current `HEAD`; changing the base or switching to an
 unrelated branch starts a fresh history.
 
-Reports use a unique
-`.git/clawsweeper/reviews/local-range-<time>-<pid>/` directory so the default
-run leaves the checkout clean. `--artifact-dir` overrides that location.
+Summary/debug reports use a unique
+`.git/clawsweeper/reviews/local-range-<time>-<pid>/` directory unless
+`--artifact-dir` overrides it. Default no-retention runs leave no persistent
+ClawSweeper review directory.
 
-Read the report at `artifacts/local-review-<number>/<number>.md`. Key fields are
+When output is retained at the default local artifact destination, read the
+report at `artifacts/local-review-<number>/<number>.md`. Key fields are
 `review_status`, `main_sha`, `pull_head_sha`, `decision`, `confidence`, and
 `Review Findings`. Do not run `apply-artifacts` or `apply-decisions` unless you
 intentionally want to move reports into durable state or sync GitHub comments.
