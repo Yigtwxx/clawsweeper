@@ -83,7 +83,12 @@ export interface CreateReviewCommandWorkflowDependencies {
     detail: string,
     stdout?: string,
     stderr?: string,
-    processResult?: { errorCode?: string | null; signal?: NodeJS.Signals | null },
+    processResult?: {
+      errorCode?: string | null;
+      signal?: NodeJS.Signals | null;
+      diagnostic?: string;
+      retryHint?: string;
+    },
   ) => Decision;
   codexFailureLogKind: (markdown: string) => string;
   CodexReviewError: new (options: {
@@ -94,6 +99,8 @@ export interface CreateReviewCommandWorkflowDependencies {
     errorCode?: string | null;
     signal?: NodeJS.Signals | null;
     retryable?: boolean;
+    diagnostic?: string;
+    retryHint?: string;
   }) => Error & {
     readonly status: number | null;
     readonly stdout: string;
@@ -101,11 +108,15 @@ export interface CreateReviewCommandWorkflowDependencies {
     readonly errorCode: string | null;
     readonly signal: NodeJS.Signals | null;
     readonly retryable: boolean;
+    readonly diagnostic: string;
+    readonly retryHint?: string;
   };
   codexReviewFailureRetryable: (error: unknown) => boolean;
+  ghJson: <T>(args: string[]) => T;
   collectItemContext: (
     item: Item,
     options?: {
+      pullRequestPayload?: unknown;
       fullTimelineForRelations?: boolean;
       reviewCacheDigest?: boolean;
       reviewCacheGitDir?: string;
@@ -228,6 +239,10 @@ export interface CreateReviewCommandWorkflowDependencies {
     worktreeDir: string;
     itemNumber: number;
     headSha: string;
+    resolveBlobSizes?: (
+      objectIds: readonly string[],
+      timeoutMs: number,
+    ) => ReadonlyMap<string, number>;
   }) => boolean;
   markdownFor: (options: {
     item: Item;
@@ -324,6 +339,7 @@ export interface CreateReviewCommandWorkflowDependencies {
     git: GitInfo;
     model: string;
     openclawDir: string;
+    reviewTreeRoot?: string;
     reasoningEffort: string;
     sandboxMode: string;
     serviceTier: string;
@@ -335,6 +351,9 @@ export interface CreateReviewCommandWorkflowDependencies {
     proofScratchDir?: string;
     prompt?: string;
     reviewEnv?: NodeJS.ProcessEnv;
+    promptFileBytes?: number;
+    resultFileBytes: number;
+    streamFileBytes?: number;
     quietLogs?: boolean;
     extraCodexConfig?: string[];
   }) => Decision;

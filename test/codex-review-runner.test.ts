@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   codexFailureDecisionForTest,
@@ -25,12 +26,45 @@ import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
 
 const trackedCheckoutContent = "tracked checkout content\n";
 const trackedCheckoutFingerprint = "8b9382c9009cdc46cb69d59eb0078522d45023b2";
+const reviewResultBytes = 4 * 1024 * 1024;
 const fakeCodexSandboxPass = `if (process.argv[2] === "sandbox") {
   process.stdout.write(${JSON.stringify(trackedCheckoutFingerprint)} + "\\n");
   process.exit(0);
 }
 // Like the real CLI, consume the prompt before a review result or early exit.
 require("node:fs").readFileSync(0, "utf8");`;
+const fakeManagedDecision = `process.stdout.write(process.env.CODEX_DECISION_JSON + "\\n");`;
+
+function runBoundedCodexForTest(
+  options: Omit<Parameters<typeof runCodexForTest>[0], "resultFileBytes"> & {
+    resultFileBytes?: number;
+  },
+) {
+  return runCodexForTest({
+    ...options,
+    resultFileBytes: options.resultFileBytes ?? reviewResultBytes,
+  });
+}
+
+function reportedReviewFailure(error: Error) {
+  const failure = error as Error & {
+    status: number | null;
+    stdout: string;
+    stderr: string;
+    errorCode: string | null;
+    signal: NodeJS.Signals | null;
+    diagnostic: string;
+    retryHint?: string;
+  };
+  assert.equal(failure.name, "CodexReviewError");
+  return codexFailureDecisionForTest(
+    failure.status,
+    failure.message,
+    failure.stdout,
+    failure.stderr,
+    failure,
+  );
+}
 
 function initTrackedRepo(dir: string, trackedPath = "tracked.txt"): void {
   writeFakeScanner(join(dirname(dir), "bin"));
@@ -63,7 +97,8 @@ for (const scanner of ["missing", "error", "finding", "unexpected-output"]) {
 const fs = require('node:fs');
 fs.appendFileSync(${JSON.stringify(calls)}, 'called\\n');
 ${fakeCodexSandboxPass}
-fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], ${JSON.stringify(JSON.stringify(closeDecision()))});
+if (process.argv.includes("--output-last-message")) process.exit(2);
+${fakeManagedDecision}
 `,
       { mode: 0o755 },
     );
@@ -80,7 +115,7 @@ fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1]
     try {
       assert.throws(
         () =>
-          runCodexForTest({
+          runBoundedCodexForTest({
             item: item({ number: 42 }),
             context: { issue: {}, comments: [], timeline: [] },
             git: { mainSha: "abc123", latestRelease: null },
@@ -92,6 +127,10 @@ fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1]
             timeoutMs: 10_000,
             workDir,
             prompt: "Return a review decision.\nfixture-sensitive-value\nsecond line",
+            extraCodexConfig: [
+              'web_search="disabled"',
+              'features.code_mode.direct_only_tool_namespaces=["functions"]',
+            ],
           }),
         (error: Error) => {
           assert.match(error.message, /Agent input scan refused/);
@@ -164,10 +203,7 @@ test("runCodex accepts valid structured output after non-zero Codex exit", () =>
     codexPath,
     `#!/usr/bin/env node
 ${fakeCodexSandboxPass}
-const fs = require("node:fs");
-const outputIndex = process.argv.indexOf("--output-last-message");
-if (outputIndex === -1) process.exit(2);
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+${fakeManagedDecision}
 process.stderr.write("wrote structured output before shutdown failure\\n");
 process.exit(1);
 `,
@@ -188,7 +224,7 @@ process.exit(1);
     }),
   );
   try {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83393 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -200,6 +236,7 @@ process.exit(1);
       timeoutMs: 10_000,
       workDir,
       prompt: "Return a review decision.",
+      resultFileBytes: Buffer.byteLength(process.env.CODEX_DECISION_JSON!),
     });
 
     assert.equal(decision.decision, "keep_open");
@@ -213,6 +250,67 @@ process.exit(1);
     else process.env.PATH = originalPath;
     if (originalDecision === undefined) delete process.env.CODEX_DECISION_JSON;
     else process.env.CODEX_DECISION_JSON = originalDecision;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runCodex forwards direct-tool configuration only when explicitly supplied", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const openclawDir = join(root, "target");
+  const workDir = join(root, "work");
+  const binDir = join(root, "bin");
+  const argsPath = join(root, "codex-args");
+  mkdirSync(openclawDir);
+  mkdirSync(binDir);
+  initTrackedRepo(openclawDir);
+  writeFileSync(
+    join(binDir, "codex"),
+    `#!${process.execPath}
+${fakeCodexSandboxPass}
+require("node:fs").writeFileSync(process.env.CODEX_ARGS_PATH, JSON.stringify(process.argv.slice(2)));
+${fakeManagedDecision}
+`,
+    { mode: 0o755 },
+  );
+  const previous = {
+    PATH: process.env.PATH,
+    CODEX_ARGS_PATH: process.env.CODEX_ARGS_PATH,
+    CODEX_DECISION_JSON: process.env.CODEX_DECISION_JSON,
+  };
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+  process.env.CODEX_ARGS_PATH = argsPath;
+  process.env.CODEX_DECISION_JSON = JSON.stringify(closeDecision({ decision: "keep_open" }));
+  const directConfig = 'features.code_mode.direct_only_tool_namespaces=["functions"]';
+  try {
+    for (const extraCodexConfig of [undefined, ['web_search="disabled"', directConfig]]) {
+      const decision = runBoundedCodexForTest({
+        item: item({ number: 83403 }),
+        context: { issue: {}, comments: [], timeline: [] },
+        git: { mainSha: "abc123", latestRelease: null },
+        model: "model-test",
+        openclawDir,
+        reasoningEffort: "high",
+        sandboxMode: "read-only",
+        serviceTier: "",
+        timeoutMs: 10_000,
+        workDir,
+        prompt: "Return a review decision.",
+        ...(extraCodexConfig ? { extraCodexConfig } : {}),
+      });
+      assert.equal(decision.localCheckoutAccess, "verified");
+      const args = JSON.parse(readFileSync(argsPath, "utf8")) as string[];
+      const config = args.filter((_, index) => args[index - 1] === "-c");
+      assert.deepEqual(
+        config.filter((value) => value.startsWith("features.code_mode")),
+        extraCodexConfig ? [directConfig] : [],
+      );
+      if (extraCodexConfig) assert.deepEqual(config.slice(-2), extraCodexConfig);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -248,7 +346,7 @@ process.exit(0);
   process.env.CODEX_INVOCATIONS_PATH = invocationsPath;
   try {
     assert.throws(() =>
-      runCodexForTest({
+      runBoundedCodexForTest({
         item: item({ number: 83396 }),
         context: { issue: {}, comments: [], timeline: [] },
         git: { mainSha: "abc123", latestRelease: null },
@@ -301,8 +399,7 @@ test("runCodex supports whitespace and Unicode in regular tracked paths", () => 
 const fs = require("node:fs");
 fs.appendFileSync(process.env.CODEX_ARGS_PATH, JSON.stringify(process.argv.slice(2)) + "\\n");
 ${fakeCodexSandboxPass}
-const outputIndex = process.argv.indexOf("--output-last-message");
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+${fakeManagedDecision}
 `,
   );
   chmodSync(codexPath, 0o755);
@@ -315,7 +412,7 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
   process.env.CODEX_ARGS_PATH = argsPath;
   process.env.CODEX_DECISION_JSON = JSON.stringify(closeDecision({ decision: "keep_open" }));
   try {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83401 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -360,8 +457,7 @@ test("runCodex supports newlines in regular tracked paths", () => {
 const fs = require("node:fs");
 fs.appendFileSync(process.env.CODEX_ARGS_PATH, JSON.stringify(process.argv.slice(2)) + "\\n");
 ${fakeCodexSandboxPass}
-const outputIndex = process.argv.indexOf("--output-last-message");
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+${fakeManagedDecision}
 `,
   );
   chmodSync(codexPath, 0o755);
@@ -374,7 +470,7 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
   process.env.CODEX_ARGS_PATH = argsPath;
   process.env.CODEX_DECISION_JSON = JSON.stringify(closeDecision({ decision: "keep_open" }));
   try {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83402 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -445,7 +541,7 @@ process.exit(0);
     process.env.CODEX_INVOCATIONS_PATH = invocationsPath;
     try {
       assert.throws(() =>
-        runCodexForTest({
+        runBoundedCodexForTest({
           item: item({ number: 83400 }),
           context: { issue: {}, comments: [], timeline: [] },
           git: { mainSha: "abc123", latestRelease: null },
@@ -490,9 +586,8 @@ if (process.argv[2] === "sandbox") {
   }, 400);
 } else {
   fs.readFileSync(0, "utf8");
-  const outputIndex = process.argv.indexOf("--output-last-message");
   setTimeout(() => {
-    fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+    ${fakeManagedDecision}
   }, 400);
 }
 `,
@@ -508,7 +603,7 @@ if (process.argv[2] === "sandbox") {
   process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS = "1";
   try {
     assert.throws(() =>
-      runCodexForTest({
+      runBoundedCodexForTest({
         item: item({ number: 83399 }),
         context: { issue: {}, comments: [], timeline: [] },
         git: { mainSha: "abc123", latestRelease: null },
@@ -574,7 +669,7 @@ process.stdout.write(JSON.stringify({ payloads: [{ text }], meta: { stopReason: 
   try {
     assert.throws(
       () =>
-        runCodexForTest({
+        runBoundedCodexForTest({
           item: item({ number: 83397 }),
           context: { issue: {}, comments: [], timeline: [] },
           git: { mainSha: "abc123", latestRelease: null },
@@ -655,7 +750,7 @@ if (count > 0) {
   process.env.CODEX_BIN = join(root, "missing-codex");
   process.env.OPENCLAW_TEST_INVOCATIONS_PATH = invocationsPath;
   try {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83396 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -697,9 +792,8 @@ const fs = require("node:fs");
 if (process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN || process.env.GITHUB_TOKEN) process.exit(3);
 fs.writeFileSync(process.env.CODEX_ARGS_PATH + ".env", JSON.stringify({ GH_TOKEN: process.env.GH_TOKEN }));
 fs.writeFileSync(process.env.CODEX_ARGS_PATH, JSON.stringify(process.argv.slice(2)));
-const outputIndex = process.argv.indexOf("--output-last-message");
-if (outputIndex === -1) process.exit(2);
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+if (process.argv.includes("--output-last-message")) process.exit(2);
+${fakeManagedDecision}
 `,
   );
   chmodSync(codexPath, 0o755);
@@ -727,7 +821,7 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
   );
 
   const runAndReadArgs = (preserveCodexAuth: boolean, sandboxMode = "read-only"): string[] => {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83395 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -775,9 +869,6 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
       openclawDir,
       "--output-schema",
       join(process.cwd(), "schema", "clawsweeper-decision.schema.json"),
-      "--output-last-message",
-      join(workDir, "83395.json"),
-      "--json",
       "--sandbox",
       "read-only",
       "--add-dir",
@@ -824,7 +915,7 @@ process.exit(1);
   try {
     assert.throws(
       () =>
-        runCodexForTest({
+        runBoundedCodexForTest({
           item: item({ number: 83394 }),
           context: { issue: {}, comments: [], timeline: [] },
           git: { mainSha: "abc123", latestRelease: null },
@@ -866,7 +957,7 @@ process.exit(1);
   }
 });
 
-test("runCodex accepts structured output after more than 128 MiB of process output", () => {
+test("runCodex keeps its managed decision when diagnostic capture truncates", () => {
   const root = mkdtempSync(tmpPrefix);
   const openclawDir = join(root, "openclaw");
   const workDir = join(root, "codex-work");
@@ -880,10 +971,13 @@ test("runCodex accepts structured output after more than 128 MiB of process outp
     `#!/usr/bin/env node
 ${fakeCodexSandboxPass}
 const fs = require("node:fs");
-const chunk = Buffer.alloc(1024 * 1024, "x");
-for (let index = 0; index < 129; index += 1) fs.writeSync(1, chunk);
-const outputIndex = process.argv.indexOf("--output-last-message");
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
+for (let index = 0; index < 32; index += 1) {
+  fs.writeSync(
+    2,
+    "tool diagnostic: " + "x".repeat(64) + "\\n",
+  );
+}
+${fakeManagedDecision}
 `,
   );
   chmodSync(codexPath, 0o755);
@@ -902,7 +996,7 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
     }),
   );
   try {
-    const decision = runCodexForTest({
+    const decision = runBoundedCodexForTest({
       item: item({ number: 83395 }),
       context: { issue: {}, comments: [], timeline: [] },
       git: { mainSha: "abc123", latestRelease: null },
@@ -911,13 +1005,15 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
       reasoningEffort: "high",
       sandboxMode: "read-only",
       serviceTier: "",
-      timeoutMs: 20_000,
+      timeoutMs: 10_000,
       workDir,
       prompt: "Return a review decision.",
+      streamFileBytes: 128,
     });
 
     assert.equal(decision.summary, "Review survived verbose Codex output.");
-    assert.equal(statSync(join(workDir, "83395.1.codex.stdout.log")).size, 128 * 1024 * 1024);
+    assert.equal(statSync(join(workDir, "83395.1.codex.stdout.log")).size, 128);
+    assert.equal(statSync(join(workDir, "83395.1.codex.stderr.log")).size, 128);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
@@ -935,6 +1031,7 @@ test("codex failure decisions expose stderr and stdout separately", () => {
     "Codex review failed for #278 with exit 1.",
     JSON.stringify({ type: "turn.failed", error: { message: errorMessage } }),
     "user\nThe reviewed prompt discusses rate limits.",
+    { diagnostic: errorMessage },
   );
 
   assert.equal(
@@ -973,6 +1070,7 @@ test("codex failure decisions do not infer buffer overflow from reviewed content
     "Codex review failed for #89041 with exit 1.",
     JSON.stringify({ type: "turn.failed", error: { message: terminalError } }),
     "user\nThe reviewed PR discusses maxBufferedChunks and maxBuffer behavior.",
+    { diagnostic: terminalError },
   );
 
   assert.equal(
@@ -1022,7 +1120,7 @@ test("codex failure decisions ignore unstructured output and prompt stderr", () 
   assert.equal(decision.codexTerminalFailure, false);
 });
 
-test("codex failure decisions trust a final stderr model access denial", () => {
+test("codex failure decisions preserve the runtime's trusted model access diagnostic", () => {
   const terminalError =
     "ERROR: stream disconnected before completion: The model secret-model-for-test does not exist or you do not have access to it.";
   const decision = codexFailureDecisionForTest(
@@ -1030,6 +1128,7 @@ test("codex failure decisions trust a final stderr model access denial", () => {
     "Codex review failed for #92565 with exit 1.",
     "",
     `reviewed patch text\n${terminalError}`,
+    { diagnostic: terminalError },
   );
 
   assert.equal(
@@ -1043,74 +1142,259 @@ test("codex failure decisions trust a final stderr model access denial", () => {
   assert.equal(decision.codexTerminalFailure, true);
 });
 
-test("runCodex leaves exhausted transport failures to the durable queue", () => {
-  const root = mkdtempSync(tmpPrefix);
-  const openclawDir = join(root, "openclaw");
-  const workDir = join(root, "codex-work");
-  const binDir = join(root, "bin");
-  const codexHome = join(root, "codex-home");
-  const attemptsPath = join(root, "attempts");
-  mkdirSync(openclawDir, { recursive: true });
-  mkdirSync(binDir, { recursive: true });
-  mkdirSync(codexHome, { recursive: true });
-  initTrackedRepo(openclawDir);
-  writeFileSync(join(codexHome, "config.toml"), 'model = "secret-model-for-test"\n');
-  const codexPath = join(binDir, "codex");
-  writeFileSync(
-    codexPath,
-    `#!/usr/bin/env node
-${fakeCodexSandboxPass}
-const fs = require("node:fs");
-const attemptsPath = process.env.CODEX_ATTEMPTS_PATH;
-const attempt = fs.existsSync(attemptsPath) ? Number(fs.readFileSync(attemptsPath, "utf8")) + 1 : 1;
-fs.writeFileSync(attemptsPath, String(attempt));
-if (attempt === 1) {
-  process.stderr.write("user\\nERROR: The model contributor-quoted-model does not exist or you do not have access to it.\\n");
-  process.stdout.write(JSON.stringify({
-    type: "turn.failed",
-    error: {
-      message: "stream disconnected: Rate limit reached for secret-model-for-test (for limit test) on tokens per min (TPM). Please try again in 1ms."
+test("interrupted reviews do not classify an untrusted stderr error suffix as terminal", () => {
+  const decision = codexFailureDecisionForTest(
+    null,
+    "Codex review interrupted.",
+    "",
+    "ERROR: The model quoted-model does not exist or you do not have access to it.\ntokens used\n1,024\n",
+    { signal: "SIGTERM" },
+  );
+  assert.equal(decision.codexTerminalFailure, false);
+  assert.equal(
+    decision.evidence.find((entry) => entry.label === "codex terminal error"),
+    undefined,
+  );
+});
+
+test("failure reporting never parses model-authored error JSON as a native diagnostic", () => {
+  const denial = "The model quoted-model does not exist or you do not have access to it.";
+  for (const output of [
+    JSON.stringify({ type: "error", message: denial }),
+    JSON.stringify({ type: "turn.failed", error: { message: denial } }),
+  ]) {
+    for (const processResult of [{}, { signal: "SIGTERM" as const }, { errorCode: "ETIMEDOUT" }]) {
+      const decision = codexFailureDecisionForTest(
+        1,
+        processResult.errorCode ? "Codex review timed out." : "Codex review failed.",
+        output,
+        `ERROR: ${denial}\ntokens used\n1,024\n`,
+        processResult,
+      );
+      assert.equal(decision.codexTerminalFailure, false);
+      assert.doesNotMatch(decision.summary, /model unavailable|access denied/);
+      assert.equal(
+        decision.evidence.find((entry) => entry.label === "codex terminal error"),
+        undefined,
+      );
     }
-  }) + "\\n");
-  process.exit(1);
+  }
+});
+
+test("non-authoritative retry hints cannot override existing failure reason priority", () => {
+  const retryHint =
+    "ERROR: Rate limit reached\nThe model quoted-model does not exist or you do not have access to it.";
+  for (const [detail, errorCode, diagnostic, reason] of [
+    ["Codex dirtied the OpenClaw checkout", "", "", "dirty checkout"],
+    ["Codex did not produce output", "", "", "missing structured output"],
+    ["Codex wrote invalid JSON", "", "", "invalid structured output"],
+    ["Codex failed", "ENOBUFS", "", "output buffer overflow"],
+    ["Codex review timed out", "ETIMEDOUT", "", "timeout"],
+    [
+      "Codex failed",
+      "",
+      "ERROR: The model fixture-model does not exist or you do not have access to it.",
+      "model unavailable or access denied",
+    ],
+    ["Codex failed: fetch failed", "", "", "retryable codex transport failure (network)"],
+  ] as const) {
+    const decision = codexFailureDecisionForTest(1, detail, "", retryHint, {
+      errorCode,
+      diagnostic,
+      retryHint,
+    });
+    assert.equal(decision.summary, `Codex review failed: ${reason} (exit 1).`);
+    assert.equal(decision.codexTerminalFailure, Boolean(diagnostic));
+  }
+  const denialOnly = codexFailureDecisionForTest(1, "Codex failed", "", "", {
+    retryHint:
+      "ERROR: upstream response\nThe model fixture does not exist or you do not have access to it.",
+  });
+  assert.equal(denialOnly.summary, "Codex review failed: codex execution failed (exit 1).");
+  assert.equal(denialOnly.codexTerminalFailure, false);
+});
+
+for (const mode of ["zero-exit", "nonzero-exit", "timeout", "timeout-multiline"] as const) {
+  test(`runCodex keeps ${mode} model output outside native failure classification`, (t) => {
+    const timedOut = mode.startsWith("timeout");
+    const root = mkdtempSync(tmpPrefix);
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const openclawDir = join(root, "target");
+    const workDir = join(root, "work");
+    const binDir = join(root, "bin");
+    mkdirSync(openclawDir);
+    mkdirSync(binDir);
+    initTrackedRepo(openclawDir);
+    const denial = "The model quoted-model does not exist or you do not have access to it.";
+    const failure =
+      mode === "timeout-multiline"
+        ? `ERROR: stream disconnected\nRate limit reached\n${denial}`
+        : `ERROR: ${denial}`;
+    const output = JSON.stringify({ type: "error", message: denial });
+    const codexPath = join(binDir, "codex");
+    writeFileSync(
+      codexPath,
+      `#!${process.execPath}
+${fakeCodexSandboxPass}
+require("node:fs").writeSync(2, ${JSON.stringify(`${failure}\ntokens used\n1,024\n`)});
+${
+  timedOut
+    ? "setInterval(() => {}, 1000);"
+    : `require("node:fs").writeSync(1, ${JSON.stringify(output + "\n")}); process.exit(${mode === "zero-exit" ? 0 : 1});`
 }
-const outputIndex = process.argv.indexOf("--output-last-message");
-fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON);
 `,
-  );
-  chmodSync(codexPath, 0o755);
-  const previous = {
-    PATH: process.env.PATH,
-    CODEX_ATTEMPTS_PATH: process.env.CODEX_ATTEMPTS_PATH,
-    CODEX_DECISION_JSON: process.env.CODEX_DECISION_JSON,
-    CODEX_HOME: process.env.CODEX_HOME,
-    CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS,
-    CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS: process.env.CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS,
+      { mode: 0o755 },
+    );
+    const preload = join(root, "synthetic-exit-tuple.mjs");
+    if (timedOut) {
+      // Keep the real worker timeout, but model taskkill's nonzero/null exit tuple.
+      writeFileSync(
+        preload,
+        `import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const spawn = childProcess.spawn;
+childProcess.spawn = function(...args) {
+  const child = spawn.apply(this, args);
+  const once = child.once;
+  child.once = function(event, listener) {
+    return once.call(this, event, event === "close"
+      ? () => listener(1, null)
+      : listener);
   };
-  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
-  process.env.CODEX_ATTEMPTS_PATH = attemptsPath;
-  process.env.CODEX_DECISION_JSON = JSON.stringify(
-    closeDecision({
-      decision: "keep_open",
-      closeReason: "none",
-      confidence: "medium",
-      summary: "Review completed after a fresh Codex process.",
-      bestSolution: "Continue the existing review loop.",
-      closeComment: "",
-      workReason: "No additional implementation is required.",
-    }),
-  );
-  process.env.CODEX_HOME = codexHome;
-  process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS = "2";
-  process.env.CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS = "1";
-  try {
+  return child;
+};
+syncBuiltinESMExports();
+`,
+      );
+    }
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
+    t.after(() => {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    });
     assert.throws(
       () =>
-        runCodexForTest({
-          item: item({ number: 83394 }),
+        runBoundedCodexForTest({
+          item: item({ number: 42 }),
           context: { issue: {}, comments: [], timeline: [] },
           git: { mainSha: "abc123", latestRelease: null },
-          model: "internal",
+          model: "model-test",
+          openclawDir,
+          reasoningEffort: "high",
+          sandboxMode: "read-only",
+          serviceTier: "",
+          timeoutMs: timedOut ? 5_000 : 10_000,
+          workDir,
+          prompt: "Return a review decision.",
+          reviewEnv: {
+            ...process.env,
+            CODEX_BIN: codexPath,
+            ...(timedOut ? { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` } : {}),
+          },
+        }),
+      (
+        error: Error & {
+          status?: number | null;
+          signal?: NodeJS.Signals | null;
+          errorCode?: string | null;
+          retryable?: boolean;
+          diagnostic?: string;
+          retryHint?: string;
+        },
+      ) => {
+        assert.equal(error.diagnostic, "");
+        assert.equal(error.retryHint, undefined);
+        const decision = reportedReviewFailure(error);
+        assert.equal(decision.codexTerminalFailure, false);
+        assert.equal(
+          decision.evidence.find((entry) => entry.label === "codex terminal error"),
+          undefined,
+        );
+        if (timedOut) {
+          assert.equal(error.status, 1);
+          assert.equal(error.signal, null);
+          assert.equal(error.errorCode, "ETIMEDOUT");
+          assert.equal(error.retryable, true);
+          assert.match(decision.summary, /timeout/);
+        } else {
+          assert.match(decision.summary, /invalid structured output/);
+        }
+        return true;
+      },
+    );
+    assert.equal(existsSync(join(workDir, "42.json")), !timedOut);
+  });
+}
+
+for (const [name, failure, kind] of [
+  ["capacity LF", "ERROR: upstream response\n\nRate limit reached.\n", "capacity"],
+  [
+    "capacity CRLF with locale usage",
+    "ERROR: upstream response\r\n\r\nRate limit reached.\r\ntokens used\r\n1\u202f234\r\n",
+    "capacity",
+  ],
+  [
+    "final network after quoted denial",
+    "ERROR: The model quoted-model does not exist or you do not have access to it.\nERROR: stream disconnected before completion:\nfetch failed\ntokens used\n1,024\n",
+    "network",
+  ],
+  [
+    "denial-only",
+    "ERROR: upstream response\nThe model quoted-model does not exist or you do not have access to it.\ntokens used\n0\n",
+    "",
+  ],
+  [
+    "mixed transient and denial",
+    "ERROR: Rate limit reached\nThe model quoted-model does not exist or you do not have access to it.\nOPENAI_API_KEY=fixture-secret-value\ntokens used\n0\n",
+    "capacity",
+  ],
+  [
+    "final denial after quoted transient",
+    "ERROR: quoted response\nRate limit reached.\nERROR: upstream response\nThe model quoted-model does not exist or you do not have access to it.\n",
+    "",
+  ],
+  [
+    "malformed usage",
+    "ERROR: upstream response\nRate limit reached.\ntokens used\nnot a count\n",
+    "",
+  ],
+] as const) {
+  test(`runCodex keeps multiline ${name} failures separate from trusted diagnostics`, (t) => {
+    const root = mkdtempSync(tmpPrefix);
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const openclawDir = join(root, "target");
+    const workDir = join(root, "work");
+    const binDir = join(root, "bin");
+    const attemptsPath = join(root, "attempts");
+    mkdirSync(openclawDir);
+    mkdirSync(binDir);
+    initTrackedRepo(openclawDir);
+    const codexPath = join(binDir, "codex");
+    writeFileSync(
+      codexPath,
+      `#!${process.execPath}
+${fakeCodexSandboxPass}
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(attemptsPath)}, "attempt\\n");
+fs.writeSync(2, ${JSON.stringify(failure)});
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
+    t.after(() => {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    });
+    assert.throws(
+      () =>
+        runBoundedCodexForTest({
+          item: item({ number: 42 }),
+          context: { issue: {}, comments: [], timeline: [] },
+          git: { mainSha: "abc123", latestRelease: null },
+          model: "model-test",
           openclawDir,
           reasoningEffort: "high",
           sandboxMode: "read-only",
@@ -1118,23 +1402,142 @@ fs.writeFileSync(process.argv[outputIndex + 1], process.env.CODEX_DECISION_JSON)
           timeoutMs: 10_000,
           workDir,
           prompt: "Return a review decision.",
+          reviewEnv: {
+            ...process.env,
+            CODEX_BIN: codexPath,
+            CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: "2",
+          },
         }),
-      (error: Error & { retryable?: boolean }) => {
-        assert.equal(error.retryable, true);
-        assert.match(error.message, /Rate limit reached/);
-        assert.doesNotMatch(error.message, /contributor-quoted-model/);
+      (error: Error & { retryable?: boolean; retryHint?: string; diagnostic?: string }) => {
+        assert.equal(error.retryable, Boolean(kind));
+        assert.equal(Boolean(error.retryHint), Boolean(kind));
+        assert.equal(error.diagnostic, "");
+        assert.doesNotMatch(error.message, /Rate limit|fetch failed|quoted-model|fixture-secret/);
+        assert.doesNotMatch(error.retryHint ?? "", /fixture-secret-value/);
+        if (name === "mixed transient and denial") {
+          assert.match(error.retryHint ?? "", /OPENAI_API_KEY=\[REDACTED\]/);
+        }
+        const decision = reportedReviewFailure(error);
+        assert.equal(decision.codexTerminalFailure, false);
+        assert.equal(
+          decision.summary,
+          `Codex review failed: ${kind ? `retryable codex transport failure (${kind})` : "codex execution failed"} (exit 1).`,
+        );
+        assert.equal(
+          decision.evidence.find((entry) => entry.label === "codex terminal error"),
+          undefined,
+        );
+        const hintEvidence = decision.evidence.find((entry) => entry.label === "codex retry hint");
+        assert.equal(Boolean(hintEvidence), Boolean(kind));
+        if (hintEvidence) {
+          assert.match(hintEvidence.detail, /Non-authoritative.*captured stderr/);
+          assert.doesNotMatch(hintEvidence.detail, /Rate limit|quoted-model|fixture-secret/);
+        }
+        assert.doesNotMatch(JSON.stringify(decision), /fixture-secret-value/);
         return true;
       },
     );
-    assert.equal(readFileSync(attemptsPath, "utf8"), "1");
-  } finally {
-    for (const [key, value] of Object.entries(previous)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+    assert.equal(readFileSync(attemptsPath, "utf8"), "attempt\n");
+    assert.equal(existsSync(join(workDir, "42.json")), false);
+  });
+}
+
+for (const [kind, failure] of [
+  [
+    "capacity",
+    "stream disconnected: Rate limit reached for secret-model-for-test (for limit test) on tokens per min (TPM). Please try again in 1ms.",
+  ],
+  ["network", "stream disconnected before completion: fetch failed"],
+] as const)
+  test(`runCodex leaves exhausted ${kind} failures with native trailers to the durable queue`, () => {
+    const root = mkdtempSync(tmpPrefix);
+    const openclawDir = join(root, "openclaw");
+    const workDir = join(root, "codex-work");
+    const binDir = join(root, "bin");
+    const codexHome = join(root, "codex-home");
+    const attemptsPath = join(root, "attempts");
+    mkdirSync(openclawDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(codexHome, { recursive: true });
+    initTrackedRepo(openclawDir);
+    writeFileSync(join(codexHome, "config.toml"), 'model = "secret-model-for-test"\n');
+    const codexPath = join(binDir, "codex");
+    writeFileSync(
+      codexPath,
+      `#!/usr/bin/env node
+${fakeCodexSandboxPass}
+const fs = require("node:fs");
+const attemptsPath = process.env.CODEX_ATTEMPTS_PATH;
+const attempt = fs.existsSync(attemptsPath) ? Number(fs.readFileSync(attemptsPath, "utf8")) + 1 : 1;
+fs.writeFileSync(attemptsPath, String(attempt));
+if (attempt === 1) {
+  process.stderr.write("user\\nERROR: The model contributor-quoted-model does not exist or you do not have access to it.\\n");
+  process.stderr.write(${JSON.stringify(`ERROR: ${failure}\ntokens used\n1,024\n`)});
+  process.exit(1);
+}
+${fakeManagedDecision}
+`,
+    );
+    chmodSync(codexPath, 0o755);
+    const previous = {
+      PATH: process.env.PATH,
+      CODEX_ATTEMPTS_PATH: process.env.CODEX_ATTEMPTS_PATH,
+      CODEX_DECISION_JSON: process.env.CODEX_DECISION_JSON,
+      CODEX_HOME: process.env.CODEX_HOME,
+      CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS,
+      CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS: process.env.CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS,
+    };
+    process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+    process.env.CODEX_ATTEMPTS_PATH = attemptsPath;
+    process.env.CODEX_DECISION_JSON = JSON.stringify(
+      closeDecision({
+        decision: "keep_open",
+        closeReason: "none",
+        confidence: "medium",
+        summary: "Review completed after a fresh Codex process.",
+        bestSolution: "Continue the existing review loop.",
+        closeComment: "",
+        workReason: "No additional implementation is required.",
+      }),
+    );
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS = "2";
+    process.env.CLAWSWEEPER_CODEX_REVIEW_RETRY_DELAY_MS = "1";
+    try {
+      assert.throws(
+        () =>
+          runBoundedCodexForTest({
+            item: item({ number: 83394 }),
+            context: { issue: {}, comments: [], timeline: [] },
+            git: { mainSha: "abc123", latestRelease: null },
+            model: "internal",
+            openclawDir,
+            reasoningEffort: "high",
+            sandboxMode: "read-only",
+            serviceTier: "",
+            timeoutMs: 10_000,
+            workDir,
+            prompt: "Return a review decision.",
+          }),
+        (error: Error & { retryable?: boolean }) => {
+          assert.equal(error.retryable, true);
+          assert.match(error.message, kind === "capacity" ? /Rate limit reached/ : /fetch failed/);
+          assert.doesNotMatch(error.message, /contributor-quoted-model/);
+          const decision = reportedReviewFailure(error);
+          assert.match(decision.summary, new RegExp(`transport failure \\(${kind}\\)`));
+          assert.equal(decision.codexTerminalFailure, false);
+          return true;
+        },
+      );
+      assert.equal(readFileSync(attemptsPath, "utf8"), "1");
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
     }
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  });
 
 test("runCodex does not retry terminal model access failures", () => {
   const root = mkdtempSync(tmpPrefix);
@@ -1155,7 +1558,7 @@ const attemptsPath = process.env.CODEX_ATTEMPTS_PATH;
 const attempt = fs.existsSync(attemptsPath) ? Number(fs.readFileSync(attemptsPath, "utf8")) + 1 : 1;
 fs.writeFileSync(attemptsPath, String(attempt));
 process.stderr.write("reviewed patch text\\n");
-process.stderr.write("stream disconnected before completion: The model secret-model-for-test does not exist or you do not have access to it.\\n");
+process.stderr.write("ERROR: stream disconnected before completion: The model secret-model-for-test does not exist or you do not have access to it.\\ntokens used\\n1,024\\n");
 process.exit(1);
 `,
   );
@@ -1173,7 +1576,7 @@ process.exit(1);
   try {
     assert.throws(
       () =>
-        runCodexForTest({
+        runBoundedCodexForTest({
           item: item({ number: 89041 }),
           context: { issue: {}, comments: [], timeline: [] },
           git: { mainSha: "abc123", latestRelease: null },
@@ -1187,8 +1590,12 @@ process.exit(1);
           prompt: "Return a review decision.",
         }),
       (error: unknown) => {
-        const reviewError = error as Error & { stderr?: string };
+        const reviewError = error as Error & { stderr?: string; retryable?: boolean };
         assert.match(reviewError.stderr ?? "", /does not exist or you do not have access/);
+        assert.equal(reviewError.retryable, false);
+        const decision = reportedReviewFailure(reviewError);
+        assert.equal(decision.codexTerminalFailure, true);
+        assert.match(decision.summary, /model unavailable or access denied/);
         return true;
       },
     );

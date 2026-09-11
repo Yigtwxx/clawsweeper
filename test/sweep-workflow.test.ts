@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
@@ -423,7 +424,7 @@ test("sweep keeps optional media tooling out of review startup", () => {
   assert.doesNotMatch(workflow, /setup-media-proof-tools/);
 });
 
-test("exact event review exposes the token-only signal before runtime setup", () => {
+test("exact event review builds the admission predicate before signals and target runtime setup", () => {
   type Step = {
     name?: string;
     uses?: string;
@@ -441,6 +442,7 @@ test("exact event review exposes the token-only signal before runtime setup", ()
     return value;
   };
   const ordered = [
+    ["pnpm build", index((step) => step.uses === "./.github/actions/setup-pnpm", "pnpm")],
     [
       "claim-time no-op revalidation",
       index((step) => step.name === "Check live target item state", "live item"),
@@ -453,7 +455,6 @@ test("exact event review exposes the token-only signal before runtime setup", ()
       "eyes reaction",
       index((step) => step.name === "React to target item review start", "reaction"),
     ],
-    ["pnpm build", index((step) => step.uses === "./.github/actions/setup-pnpm", "pnpm")],
     [
       "target checkout",
       index((step) => step.name === "Check out target repository", "target checkout"),
@@ -493,7 +494,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
       action: "./.github/actions/setup-openclaw-codex-source",
       targetRepo: "${{ steps.target.outputs.target_repo }}",
       targetDir: "${{ steps.target.outputs.target_checkout_dir }}",
-      artifactDir: "${{ github.workspace }}/artifacts/event",
       reviewStep: "Review exact event item",
     },
     {
@@ -501,7 +501,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
       action: "./clawsweeper/.github/actions/setup-openclaw-codex-source",
       targetRepo: "${{ needs.plan.outputs.target_repo }}",
       targetDir: "${{ needs.plan.outputs.target_checkout_dir }}",
-      artifactDir: "${{ github.workspace }}/review-artifacts/shard-${{ matrix.shard }}",
       reviewStep: "Review shard",
     },
   ] as const) {
@@ -518,7 +517,6 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
     assert.deepEqual(steps[sourceCheckout]!.with, {
       "target-repo": scenario.targetRepo,
       "target-dir": scenario.targetDir,
-      "review-artifact-dir": scenario.artifactDir,
     });
   }
 });
@@ -1332,7 +1330,8 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(targetToken?.if ?? "", /scheduled_semantic_noop != 'true'/);
   assert.doesNotMatch(targetToken?.if ?? "", /outputs\.proceed == 'true'/);
   const setupPnpm = reviewer.steps.find((step) => step.id === "setup-pnpm");
-  assert.match(setupPnpm?.if ?? "", /scheduled_semantic_noop != 'true'/);
+  assert.match(setupPnpm?.if ?? "", /target_enabled == 'true'/);
+  assert.ok(reviewer.steps.indexOf(setupPnpm!) < reviewer.steps.indexOf(liveItem));
   const bundle = reviewer.steps.find((step) => step.id === "create-exact-review-bundle");
   assert.match(bundle?.if ?? "", /scheduled_semantic_noop != 'true'/);
   const semanticNoopResult = reviewer.steps.find(
@@ -7479,6 +7478,256 @@ test("apply job requeues drift-blocked close reviews only for default cursor run
   assert.match(step, /supersedes_in_progress: false/);
 });
 
+test("exact oversized PR admission uses the built predicate before reactions, reservation and target setup", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  const steps = workflow.jobs["event-review-apply"].steps;
+  const live = steps.find((step: any) => step.id === "live-item");
+  const review = steps.find((step: any) => step.id === "review-exact-event-item");
+  assert.match(live.run, /dist\/clawsweeper-oversized-pr-policy\.js/);
+  assert.match(review.run, /--pr-admission-file/);
+  assert.doesNotMatch(review.if, /outputs\.oversized/);
+  const reserve = steps.find((step: any) => step.id === "reserve-exact-review-lease");
+  assert.doesNotMatch(reserve.if, /oversized/);
+  assert.match(reserve.if, /live-item\.outputs\.proceed == 'true'/);
+  const fence = steps.find((step: any) => step.id === "review-status-fence");
+  assert.doesNotMatch(fence.if, /oversized/);
+  const oversizedBranch = review.run.slice(
+    review.run.indexOf('if [ "$OVERSIZED_PR" = "true" ]; then'),
+    review.run.indexOf('codex_timeout_ms="'),
+  );
+  assert.match(oversizedBranch, /--output-retention debug/);
+  assert.match(oversizedBranch, /--review-lease-owner "\$REVIEW_LEASE_OWNER"/);
+  assert.match(oversizedBranch, /--review-lease-comment-id "\$REVIEW_LEASE_COMMENT_ID"/);
+  for (const reservation of ["posted", "held", "superseded", ""]) {
+    for (const authorized of [true, false]) {
+      const condition = review.if
+        .slice(3, -2)
+        .replaceAll("steps.claim-exact-review-queue.outputs.claimed", '"true"')
+        .replaceAll("steps.live-item.outputs.proceed", '"true"')
+        .replaceAll("steps.reserve-exact-review-lease.outputs.status", JSON.stringify(reservation))
+        .replaceAll("steps.review-status-fence.outcome", '"success"')
+        .replaceAll(
+          "steps.review-status-fence.outputs.authorized",
+          JSON.stringify(String(authorized)),
+        )
+        .replaceAll("steps.release-review-status-fence.outputs.authorized", '"true"');
+      assert.equal(Function(`return (${condition})`)(), reservation === "posted" && authorized);
+    }
+  }
+  for (const id of [
+    "create-exact-review-bundle",
+    "direct-setup-state",
+    "prepare-direct-exact-review-publication",
+  ]) {
+    const publication = steps.find((step: any) => step.id === id);
+    assert.doesNotMatch(publication.if, /oversized/);
+  }
+  assert.match(
+    steps.find((step: any) => step.id === "prepare-direct-exact-review-publication").run,
+    /repair:publish-event-result/,
+  );
+  for (const step of steps.filter(
+    (step: any) =>
+      step.name === "React to target item review start" ||
+      step.name === "Check out target repository" ||
+      [
+        "./.github/actions/setup-openclaw-codex-source",
+        "./.github/actions/setup-codex",
+        "./.github/actions/setup-openclaw",
+      ].includes(step.uses),
+  )) {
+    assert.match(step.if, /outputs\.oversized != 'true'/, step.name ?? step.uses);
+  }
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    symlinkSync(join(process.cwd(), "dist"), join(root, "dist"), "dir");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const gh = join(bin, "gh");
+    const calls = join(root, "calls");
+    writeFileSync(
+      gh,
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$MOCK_CALLS"
+case "$2" in
+  */branches/main) echo '{}' ;;
+  */issues/141913) echo '{"state":"open","locked":false,"pull_request":{}}' ;;
+  */pulls/141913) cat "$MOCK_PULL" ;;
+  *) echo 'unexpected GitHub call' >&2; exit 91 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    for (const [total, labels, expected] of [
+      [50000, [], "false"],
+      [50001, [], "true"],
+      [166686, ["size: accepted-large"], "false"],
+      [undefined, [], "false"],
+    ] as const) {
+      const fixture = join(root, "pull.json");
+      writeFileSync(
+        fixture,
+        JSON.stringify({
+          number: 141913,
+          state: "open",
+          locked: false,
+          additions: total,
+          deletions: 0,
+          changed_files: 2747,
+          head: { sha: "b".repeat(40) },
+          labels,
+        }),
+      );
+      const output = join(root, `output-${expected}-${total}`);
+      execFileSync("bash", ["-c", live.run], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${bin}${delimiter}${process.env.PATH}`,
+          GH_TOKEN: "synthetic",
+          CLAIM_DECISION: "{}",
+          CLAIM_TARGET_BRANCH: "main",
+          GITHUB_OUTPUT: output,
+          TARGET_REPO: "openclaw/openclaw",
+          ITEM_NUMBER: "141913",
+          MOCK_CALLS: calls,
+          MOCK_PULL: fixture,
+        },
+      });
+      assert.match(readText(output), new RegExp(`oversized=${expected}`));
+      assert.match(readText(output), /proceed=true/);
+    }
+    assert.equal(
+      readText(calls)
+        .split("\n")
+        .filter((line) => line.includes("/pulls/141913")).length,
+      4,
+    );
+    assert.doesNotMatch(readText(calls), /POST|PATCH|DELETE|comments|files/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of [
+  "stable",
+  "revoked",
+  "head-drift",
+  "exempt",
+  "under-limit",
+  "closed",
+] as const) {
+  test(`oversized exact-event reservation handoff: ${scenario}`, () => {
+    const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+    const steps = workflow.jobs["event-review-apply"].steps;
+    const run = steps.find((step: any) => step.id === "review-exact-event-item").run as string;
+    const finalize = run.slice(
+      run.indexOf("mark_finalizing() {"),
+      run.indexOf("trap cleanup_heartbeat EXIT"),
+    );
+    const branch = run
+      .slice(
+        run.indexOf('if [ "$OVERSIZED_PR" = "true" ]; then'),
+        run.indexOf('codex_timeout_ms="'),
+      )
+      .replaceAll("${{ steps.target.outputs.target_repo }}", "example/project")
+      .replaceAll("${{ steps.target.outputs.item_number }}", "1");
+    const root = mkdtempSync(tmpPrefix);
+    try {
+      symlinkSync(join(process.cwd(), "dist"), join(root, "dist"), "dir");
+      const admission = join(root, "admission.json");
+      const pull = {
+        number: 1,
+        state: "open",
+        additions: 50001,
+        deletions: 0,
+        changed_files: 1,
+        head: { sha: "b".repeat(40) },
+        labels: [] as string[],
+        updated_at: "2026-09-08T00:00:00Z",
+        comments: 0,
+      };
+      const original = JSON.stringify({ repo: "example/project", pull });
+      writeFileSync(admission, original);
+      const current = { ...pull, comments: 1, updated_at: "2026-09-08T00:00:01Z" };
+      if (scenario === "head-drift") current.head = { sha: "c".repeat(40) };
+      if (scenario === "exempt") current.labels = ["size: accepted-large"];
+      if (scenario === "under-limit") current.additions = 49999;
+      if (scenario === "closed") current.state = "closed";
+      const fixture = join(root, "pull.json");
+      writeFileSync(fixture, JSON.stringify(current));
+      const output = join(root, "output");
+      const calls = join(root, "calls");
+      execFileSync(
+        "bash",
+        [
+          "-e",
+          "-u",
+          "-c",
+          `
+        pnpm() { printf '%s\\n' "$*" > "$MOCK_CALLS"; }
+        gh() { cat "$MOCK_PULL"; }
+        sleep() { return 0; }
+        start_heartbeat() { return 0; }
+        cleanup_heartbeat() { return 0; }
+        control_plane_curl() { printf '%s' "$MOCK_HTTP_STATUS"; }
+        heartbeat_payload='{}'
+        superseded_marker="$TEST_ROOT/superseded"
+        admission_args=(--pr-admission-file "$PR_ADMISSION_FILE")
+        ${finalize}
+        ${branch}
+        exit 91
+      `,
+        ],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            PR_ADMISSION_FILE: admission,
+            MOCK_PULL: fixture,
+            MOCK_CALLS: calls,
+            MOCK_HTTP_STATUS: scenario === "revoked" ? "409" : "200",
+            REVIEW_LEASE_OWNER: "reserved",
+            REVIEW_LEASE_COMMENT_ID: "1000",
+            TEST_ROOT: root,
+            OVERSIZED_PR: "true",
+            GITHUB_OUTPUT: output,
+            QUEUE_URL: "http://127.0.0.1",
+          },
+        },
+      );
+      assert.match(readText(output), /^exit_code=0$/m);
+      if (scenario === "stable" || scenario === "revoked") {
+        assert.match(
+          readText(calls),
+          /--review-lease-owner reserved --review-lease-comment-id 1000/,
+        );
+        const refreshed = JSON.parse(readText(admission));
+        assert.deepEqual(refreshed.pull, current);
+        assert.ok(Number.isFinite(Date.parse(refreshed.observedAt)));
+        if (scenario === "revoked") assert.match(readText(output), /^superseded=true$/m);
+        else assert.doesNotMatch(readText(output), /superseded|retry_at/);
+      } else {
+        assert.equal(existsSync(calls), false);
+        assert.equal(readText(admission), original);
+        assert.match(readText(output), /^retry_kind=coordination$/m);
+        assert.match(readText(output), /^retry_at=/m);
+      }
+      assert.match(
+        steps.find((step: any) => step.id === "create-exact-review-bundle").if,
+        /review-exact-event-item\.outputs\.superseded != 'true'/,
+      );
+      assert.match(
+        steps.find((step: any) => step.id === "create-exact-review-bundle").if,
+        /review-exact-event-item\.outputs\.retry_at == ''/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("all workflow control-plane curls use the shared helper after download or full checkout", () => {
   for (const file of [
     "sweep.yml",
@@ -7496,7 +7745,7 @@ test("all workflow control-plane curls use the shared helper after download or f
         if (step.name === "Fetch control-plane retry helper") {
           assert.match(
             run,
-            /curl -fsSL --retry 3 "https:\/\/raw\.githubusercontent\.com\/\$\{GITHUB_REPOSITORY\}\/\$\{GITHUB_SHA\}\/scripts\/control-plane-curl\.sh"/,
+            /curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https:\/\/raw\.githubusercontent\.com\/\$\{GITHUB_REPOSITORY\}\/\$\{GITHUB_SHA\}\/scripts\/control-plane-curl\.sh"/,
           );
           assert.match(run, /test -s "\$RUNNER_TEMP\/control-plane-curl\.sh"/);
           assert.match(run, /declare -F control_plane_curl/);

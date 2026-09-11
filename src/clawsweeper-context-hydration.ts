@@ -14,7 +14,7 @@ import { createRelatedContext } from "./clawsweeper-related-context.js";
 import {
   ensurePullRequestReviewHead,
   ensureReviewTreeCommit,
-  githubReviewBlobSizes,
+  githubReviewTreeBlobSizes,
   hydratePullRequestReviewBlobs,
   hydratePullRequestReviewHistory,
   materializePullRequestReviewTree,
@@ -44,6 +44,9 @@ import type {
 import { isGitHubNotFoundError } from "./github-retry.js";
 import { type RepositoryProfile } from "./repository-profiles.js";
 import { compareCodeUnits, stableJson } from "./stable-json.js";
+
+const REVIEW_TREE_METADATA_JQ =
+  '{truncated, tree: (.tree | if type == "array" then map(if type == "object" then {type, sha, size} else . end) else . end)}';
 
 interface CreateContextHydrationDependencies {
   asRecord: (value: unknown) => Record<string, unknown>;
@@ -977,17 +980,33 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
           "Could not establish complete review ancestry.",
         );
       }
+      const remoteTreeSizes = new Map<string, ReadonlyMap<string, number>>();
+      const treeSizes = (revision: string): ReadonlyMap<string, number> => {
+        const cached = remoteTreeSizes.get(revision);
+        if (cached) return cached;
+        const sizes = githubReviewTreeBlobSizes({
+          repository: targetRepo(),
+          headSha: revision,
+          request: (path) => ghJson(["api", path, "--jq", REVIEW_TREE_METADATA_JQ]),
+        });
+        remoteTreeSizes.set(revision, sizes);
+        return sizes;
+      };
       const hydrateBlobs = (revision: string) =>
         hydratePullRequestReviewBlobs({
           targetDir: options.targetDir,
           baseSha: revision,
           headSha,
-          resolveBlobSizes: (objectIds) =>
-            githubReviewBlobSizes({
-              repository: targetRepo(),
-              objectIds,
-              request: (query) => ghJson(["api", "graphql", "-f", `query=${query}`]),
-            }),
+          resolveBlobSizes: (objectIds) => {
+            const baseSizes = treeSizes(revision);
+            const headSizes = revision === headSha ? baseSizes : treeSizes(headSha);
+            return new Map(
+              objectIds.flatMap((objectId) => {
+                const bytes = headSizes.get(objectId) ?? baseSizes.get(objectId);
+                return bytes === undefined ? [] : [[objectId, bytes]];
+              }),
+            );
+          },
         });
       hydrateBlobs(mergeBaseSha);
       if (baseSha !== mergeBaseSha) {
@@ -1086,7 +1105,29 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
     sameAuthorCounterpartApplyReason,
     hydratePullRequestReviewSource,
     ensurePullRequestReviewHead,
-    materializePullRequestReviewTree,
+    materializePullRequestReviewTree: (
+      options: Parameters<typeof materializePullRequestReviewTree>[0],
+    ) => {
+      let remoteTreeSizes: ReadonlyMap<string, number> | null = null;
+      return materializePullRequestReviewTree({
+        ...options,
+        resolveBlobSizes: (objectIds, timeoutMs) => {
+          remoteTreeSizes ??= githubReviewTreeBlobSizes({
+            repository: targetRepo(),
+            headSha: options.headSha,
+            // Path and URL metadata can exceed the CLI capture limit before admission runs.
+            request: (path) =>
+              ghJsonOnce(["api", path, "--jq", REVIEW_TREE_METADATA_JQ], timeoutMs),
+          });
+          return new Map(
+            objectIds.flatMap((objectId) => {
+              const bytes = remoteTreeSizes!.get(objectId);
+              return bytes === undefined ? [] : [[objectId, bytes]];
+            }),
+          );
+        },
+      });
+    },
     removePullRequestReviewTree,
     staleVersionBugCloseEnabled,
     structuralExternalRelationSensitivity,

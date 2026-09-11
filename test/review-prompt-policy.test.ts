@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -17,7 +24,12 @@ import {
   renderReviewCommentFromReport,
   reviewPromptForTest,
 } from "../dist/clawsweeper.js";
-import { mediaProofCommandRunner } from "../dist/clawsweeper-media-proof.js";
+import {
+  MEDIA_PROOF_MAX_DERIVED_BYTES,
+  MEDIA_PROOF_MAX_DOWNLOAD_BYTES,
+  MEDIA_PROOF_MAX_TOTAL_DOWNLOAD_BYTES,
+  mediaProofCommandRunner,
+} from "../dist/clawsweeper-media-proof.js";
 import { LIVE_VERIFICATION_MARKER } from "../dist/clawsweeper-policy.js";
 import type { LiveProofPlan } from "../dist/clawsweeper-types.js";
 import {
@@ -558,6 +570,10 @@ test("media proof preparation extracts browser-unplayable ffmpeg-decodeable vide
       timeline: [],
     };
     const calls: string[] = [];
+    const metadata = JSON.stringify({
+      format: { duration: "46.49" },
+      streams: [{ codec_name: "h264", width: 734, height: 1038 }],
+    });
     const prepared = prepareMediaProofArtifactsForTest(context, dir, (command, args) => {
       calls.push(`${command} ${args.join(" ")}`);
       if (command === "curl") {
@@ -567,16 +583,13 @@ test("media proof preparation extracts browser-unplayable ffmpeg-decodeable vide
         return { status: 0, stdout: "", stderr: "" };
       }
       if (command === "ffprobe") {
-        return {
-          status: 0,
-          stdout: JSON.stringify({
-            format: { duration: "46.49" },
-            streams: [{ codec_name: "h264", width: 734, height: 1038 }],
-          }),
-          stderr: "",
-        };
+        return { status: 0, stdout: metadata, stderr: "" };
       }
       if (command === "ffmpeg") {
+        assert.equal(
+          args[args.indexOf("-fs") + 1],
+          String(MEDIA_PROOF_MAX_DERIVED_BYTES - Buffer.byteLength(metadata)),
+        );
         const output = String(args.at(-1));
         writeFileSync(output, "fake contact sheet");
         return { status: 0, stdout: "", stderr: "" };
@@ -596,6 +609,44 @@ test("media proof preparation extracts browser-unplayable ffmpeg-decodeable vide
     assert.match(calls.join("\n"), /^curl /m);
     assert.match(calls.join("\n"), /^ffprobe /m);
     assert.match(calls.join("\n"), /^ffmpeg /m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("media proof records missing contact sheets and continues later artifacts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawsweeper-media-proof-"));
+  try {
+    let item = 0;
+    const prepared = prepareMediaProofArtifactsForTest(
+      {
+        issue: {},
+        comments: [{ body: "https://example.com/1.mov\nhttps://example.com/2.mov" }],
+        timeline: [],
+      },
+      dir,
+      (command, args) => {
+        if (command === "curl") {
+          item += 1;
+          writeFileSync(String(args[args.indexOf("--output") + 1]), "fake video");
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        if (command === "ffprobe") {
+          return { status: 0, stdout: '{"streams":[{"codec_name":"h264"}]}', stderr: "" };
+        }
+        if (item === 2) writeFileSync(String(args.at(-1)), "fake contact sheet");
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    assert.equal(prepared.artifacts.length, 2);
+    assert.equal(prepared.artifacts[0]?.status, "failed");
+    assert.match(prepared.artifacts[0]?.detail ?? "", /did not produce a contact sheet/);
+    assert.ok(prepared.artifacts[0]?.downloadedPath);
+    assert.ok(prepared.artifacts[0]?.metadataPath);
+    assert.equal(prepared.artifacts[0]?.contactSheetPath, null);
+    assert.equal(prepared.artifacts[1]?.status, "prepared");
+    assert.ok(prepared.artifacts[1]?.contactSheetPath);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -665,6 +716,79 @@ test("media proof preparation surfaces a failed screenshot download as a failed 
   }
 });
 
+test("media proof rejects an oversized download within the declared curl budget", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawsweeper-media-proof-budget-"));
+  try {
+    const url = "https://example.com/proof.png";
+    const prepared = prepareMediaProofArtifactsForTest(
+      {
+        issue: {},
+        comments: [{ body: url }],
+        timeline: [],
+      },
+      dir,
+      (command, args) => {
+        assert.equal(command, "curl");
+        const maxIndex = args.indexOf("--max-filesize");
+        assert.equal(args[maxIndex + 1], String(MEDIA_PROOF_MAX_DOWNLOAD_BYTES));
+        const path = String(args[args.indexOf("--output") + 1]);
+        writeFileSync(path, "");
+        truncateSync(path, MEDIA_PROOF_MAX_DOWNLOAD_BYTES + 1);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    );
+    assert.equal(prepared.artifacts[0]?.status, "failed");
+    assert.match(prepared.artifacts[0]?.detail ?? "", /download exceeded/);
+    assert.equal(prepared.artifacts[0]?.downloadedPath, null);
+    assert.equal(existsSync(join(dir, "proof-image-1.png")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("media proof passes the shared remaining-byte budget to each download producer", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawsweeper-media-proof-pool-"));
+  try {
+    const limits: number[] = [];
+    const written = [24 * 1024 * 1024, 32 * 1024 * 1024, 8 * 1024 * 1024];
+    const prepared = prepareMediaProofArtifactsForTest(
+      {
+        issue: {},
+        comments: [
+          {
+            body: [1, 2, 3, 4].map((index) => `https://example.com/${index}.png`).join("\n"),
+          },
+        ],
+        timeline: [],
+      },
+      dir,
+      (command, args) => {
+        assert.equal(command, "curl");
+        const limit = Number(args[args.indexOf("--max-filesize") + 1]);
+        const output = String(args[args.indexOf("--output") + 1]);
+        limits.push(limit);
+        writeFileSync(output, "");
+        truncateSync(output, written[limits.length - 1]!);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    assert.deepEqual(limits, [
+      MEDIA_PROOF_MAX_DOWNLOAD_BYTES,
+      MEDIA_PROOF_MAX_DOWNLOAD_BYTES,
+      8 * 1024 * 1024,
+    ]);
+    assert.equal(
+      written.reduce((total, bytes) => total + bytes, 0),
+      MEDIA_PROOF_MAX_TOTAL_DOWNLOAD_BYTES,
+    );
+    assert.equal(prepared.artifacts[3]?.status, "failed");
+    assert.match(prepared.artifacts[3]?.detail ?? "", /shared download budget exhausted/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const source of ["extension", "attachment"] as const) {
   test(`media proof shares each ${source} video's deadline across the maximum selected URLs`, (t) => {
     const dir = mkdtempSync(join(tmpdir(), "clawsweeper-media-proof-"));
@@ -692,10 +816,11 @@ for (const source of ["extension", "attachment"] as const) {
       (command, args, options) => {
         timeouts.push(options?.timeoutMs ?? 0);
         now += command === "curl" ? 80_000 : command === "ffprobe" ? 30_000 : 10_000;
-        if (command === "curl" && source === "attachment") {
+        if (command === "curl") {
           writeFileSync(String(args[args.indexOf("--output") + 1]), "fake video");
-          return { status: 0, stdout: "video/mp4\n" };
+          return { status: 0, stdout: source === "attachment" ? "video/mp4\n" : "" };
         }
+        if (command === "ffmpeg") writeFileSync(String(args.at(-1)), "fake contact sheet");
         return { status: 0, stdout: "{}" };
       },
     );
@@ -724,9 +849,13 @@ for (const exhaustedAfter of ["curl", "ffprobe"]) {
         timeline: [],
       },
       dir,
-      (command) => {
+      (command, args) => {
         if (command === "curl") item += 1;
         calls[item - 1]?.push(command);
+        if (command === "curl") {
+          writeFileSync(String(args[args.indexOf("--output") + 1]), "fake video");
+        }
+        if (command === "ffmpeg") writeFileSync(String(args.at(-1)), "fake contact sheet");
         if (item === 1 && command === exhaustedAfter) now += 120_000;
         return { status: 0, stdout: "{}" };
       },
@@ -763,8 +892,9 @@ test("media preparation kills a timed-out probe even when it ignores SIGTERM", (
       timeline: [],
     },
     dir,
-    (command, _args, options) => {
+    (command, args, options) => {
       if (command === "curl") {
+        writeFileSync(String(args[args.indexOf("--output") + 1]), "fake video");
         now = 119_750;
         return { status: 0 };
       }
